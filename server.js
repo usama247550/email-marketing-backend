@@ -9,6 +9,7 @@ const connectDB = require('./config/db');
 
 // Import routes
 const projectRoutes = require('./routes/projectRoutes');
+const templateRoutes = require('./routes/templateRoutes');
 
 // Load environment variables
 dotenv.config();
@@ -27,6 +28,7 @@ app.use(express.json());
 
 // Routes
 app.use('/api/projects', projectRoutes);
+app.use('/api/templates', templateRoutes);
 
 // Test route
 app.get('/api/health', (req, res) => {
