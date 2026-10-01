@@ -12,6 +12,7 @@ const projectRoutes = require('./routes/projectRoutes');
 const templateRoutes = require('./routes/templateRoutes');
 const batchRoutes = require('./routes/batchRoutes');
 const leadRoutes = require('./routes/leadRoutes');
+const dashboardRoutes = require('./routes/dashboardRoutes');
 
 // Load environment variables
 dotenv.config();
@@ -33,6 +34,7 @@ app.use('/api/projects', projectRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/batches', batchRoutes);
 app.use('/api/leads', leadRoutes);
+app.use('/api/dashboard', dashboardRoutes);
 
 // Test route
 app.get('/api/health', (req, res) => {
