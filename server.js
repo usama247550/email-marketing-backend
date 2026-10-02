@@ -28,8 +28,13 @@ connectDB();
 const app = express();
 
 // Middleware
+const allowedOrigins = [
+  'http://localhost:3000', // Local development
+  process.env.FRONTEND_URL, // Production frontend from environment variable
+].filter(Boolean); // Remove any undefined values
+
 app.use(cors({
-  origin: 'http://localhost:3000', // Frontend URL
+  origin: allowedOrigins,
   credentials: true
 }));
 app.use(express.json());
@@ -63,6 +68,7 @@ app.get('/', (req, res) => {
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 Health check: ${process.env.PUBLIC_BACKEND_URL || `http://localhost:${PORT}`}/api/health`);
+  console.log(`🌐 Allowed origins: ${allowedOrigins.join(', ')}`);
 });
