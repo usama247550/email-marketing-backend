@@ -53,19 +53,27 @@ const normalizeColumnName = (header) => {
   return normalized;
 };
 
-// Get all batches with pagination
+// Get all batches with pagination and project filtering
 const getAllBatches = async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 15;
     const skip = (page - 1) * limit;
+    const projectId = req.query.projectId;
 
-    const batches = await Batch.find()
+    // Build query filter
+    const filter = {};
+    if (projectId && projectId !== 'all') {
+      filter.projectId = projectId;
+    }
+
+    const batches = await Batch.find(filter)
+      .populate('projectId', 'name')
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit);
 
-    const total = await Batch.countDocuments();
+    const total = await Batch.countDocuments(filter);
     const totalPages = Math.ceil(total / limit);
 
     res.json({
@@ -138,12 +146,14 @@ const importCsv = async (req, res) => {
 
     const filePath = req.file.path;
     const fileName = req.file.originalname;
+    const projectId = req.body.projectId; // Get projectId from form data
     
     // Create new batch
     const batch = new Batch({
       name: fileName,
       source: 'CSV Import',
-      leadCount: 0
+      leadCount: 0,
+      projectId: projectId || null // Handle case where no project is selected
     });
     
     await batch.save();

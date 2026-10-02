@@ -25,7 +25,7 @@ const leadSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['Valid', 'Invalid'],
+    enum: ['Valid', 'Invalid', 'Unsubscribed'],
     default: 'Invalid'
   },
   createdAt: {

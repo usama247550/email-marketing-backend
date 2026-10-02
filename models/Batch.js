@@ -6,6 +6,11 @@ const batchSchema = new mongoose.Schema({
     required: true,
     trim: true
   },
+  projectId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Project',
+    required: false // Making it optional initially to handle existing batches
+  },
   source: {
     type: String,
     required: true,
