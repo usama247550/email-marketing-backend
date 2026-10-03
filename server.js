@@ -18,6 +18,7 @@ const trackingRoutes = require('./routes/trackingRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const testRoutes = require('./routes/testRoutes');
 const debugRoutes = require('./routes/debugRoutes');
+const emailApiAccountRoutes = require('./routes/emailApiAccountRoutes');
 
 // Load environment variables
 dotenv.config();
@@ -50,6 +51,7 @@ app.use('/api/track', trackingRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/test', testRoutes);
 app.use('/api/debug', debugRoutes);
+app.use('/api/email-api-accounts', emailApiAccountRoutes);
 
 // Test route
 app.get('/api/health', (req, res) => {

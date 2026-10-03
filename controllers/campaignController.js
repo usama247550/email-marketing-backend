@@ -3,8 +3,10 @@ const EmailLog = require('../models/EmailLog');
 const Project = require('../models/Project');
 const Template = require('../models/Template');
 const Lead = require('../models/Lead');
+const EmailApiAccount = require('../models/EmailApiAccount');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
+const axios = require('axios');
 
 // Helper function to generate unique tracking token
 const generateTrackingToken = () => {
@@ -26,6 +28,36 @@ const replaceTemplateVariables = (text, lead) => {
     .replace(/\{\{website\}\}/g, lead.website || '[Website]');
 };
 
+// Helper function to send email via Brevo API
+const sendEmailViaBrevo = async (apiKey, emailData) => {
+  try {
+    const response = await axios.post('https://api.brevo.com/v3/smtp/email', emailData, {
+      headers: {
+        'api-key': apiKey,
+        'Content-Type': 'application/json',
+      },
+    });
+    return { success: true, messageId: response.data.messageId };
+  } catch (error) {
+    console.error('Brevo API error:', error.response?.data || error.message);
+    return { 
+      success: false, 
+      error: error.response?.data?.message || error.message || 'Unknown Brevo API error' 
+    };
+  }
+};
+
+// Helper function to send email via SMTP
+const sendEmailViaSMTP = async (transporter, emailData) => {
+  try {
+    const result = await transporter.sendMail(emailData);
+    return { success: true, messageId: result.messageId };
+  } catch (error) {
+    console.error('SMTP error:', error.message);
+    return { success: false, error: error.message };
+  }
+};
+
 // Create campaign and trigger email sending
 exports.createCampaign = async (req, res) => {
   try {
@@ -39,13 +71,63 @@ exports.createCampaign = async (req, res) => {
       });
     }
 
-    // Fetch project, template, and leads
-    const project = await Project.findById(projectId);
+    // Fetch project and populate emailApiAccount if needed
+    const project = await Project.findById(projectId).populate('emailApiAccountId');
     if (!project) {
       return res.status(404).json({
         success: false,
         message: 'Project not found'
       });
+    }
+
+    // Validate sending method configuration
+    const sendingMethod = project.sendingMethod || 'brevo_api';
+    let emailApiAccount = null;
+    let transporter = null;
+
+    if (sendingMethod === 'brevo_api') {
+      if (!project.emailApiAccountId) {
+        return res.status(400).json({
+          success: false,
+          message: 'No Brevo API account linked to this project. Please configure one in Settings.'
+        });
+      }
+      emailApiAccount = project.emailApiAccountId;
+      if (!emailApiAccount.apiKey) {
+        return res.status(500).json({
+          success: false,
+          message: 'Brevo API account configuration is invalid'
+        });
+      }
+    } else if (sendingMethod === 'smtp') {
+      if (!project.smtpHost || !project.smtpUser || !project.smtpPassword) {
+        return res.status(400).json({
+          success: false,
+          message: 'SMTP configuration is incomplete. Please configure SMTP settings in project settings.'
+        });
+      }
+      
+      // Setup nodemailer transport
+      transporter = nodemailer.createTransporter({
+        host: project.smtpHost,
+        port: project.smtpPort,
+        secure: project.smtpPort === 465,
+        auth: {
+          user: project.smtpUser,
+          pass: project.smtpPassword
+        }
+      });
+
+      // Verify SMTP connection
+      try {
+        await transporter.verify();
+      } catch (smtpError) {
+        console.error('SMTP verification failed:', smtpError);
+        return res.status(500).json({
+          success: false,
+          message: 'SMTP configuration error: ' + smtpError.message
+        });
+      }
     }
 
     const template = await Template.findById(templateId);
@@ -56,7 +138,7 @@ exports.createCampaign = async (req, res) => {
       });
     }
 
-    // Get all valid leads from selected batches (exclude Unsubscribed and Invalid)
+    // Get all valid leads from selected batches
     const validLeads = await Lead.find({
       batchId: { $in: batchIds },
       status: 'Valid',
@@ -81,30 +163,6 @@ exports.createCampaign = async (req, res) => {
     });
 
     await campaign.save();
-
-    // Setup nodemailer transport
-    const transporter = nodemailer.createTransport({
-      host: project.smtpHost,
-      port: project.smtpPort,
-      secure: project.smtpPort === 465, // true for 465, false for other ports
-      auth: {
-        user: project.smtpUser,
-        pass: project.smtpPassword
-      }
-    });
-
-    // Verify SMTP connection
-    try {
-      await transporter.verify();
-    } catch (smtpError) {
-      console.error('SMTP verification failed:', smtpError);
-      campaign.status = 'failed';
-      await campaign.save();
-      return res.status(500).json({
-        success: false,
-        message: 'SMTP configuration error: ' + smtpError.message
-      });
-    }
 
     let sentCount = 0;
     const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || 'http://localhost:5000';
@@ -142,23 +200,50 @@ exports.createCampaign = async (req, res) => {
           trackingId
         });
 
-        // Send email
-        await transporter.sendMail({
-          from: `"${project.senderName || project.senderEmail}" <${project.senderEmail}>`,
-          to: lead.email,
-          subject: personalizedSubject,
-          html: finalBody
-        });
+        let emailResult;
 
-        // Save EmailLog and increment sent count
-        await emailLog.save();
-        sentCount++;
+        if (sendingMethod === 'brevo_api') {
+          // Send via Brevo API
+          const brevoEmailData = {
+            sender: {
+              name: project.senderName || project.senderEmail,
+              email: project.senderEmail
+            },
+            to: [{ email: lead.email }],
+            subject: personalizedSubject,
+            htmlContent: finalBody
+          };
+
+          emailResult = await sendEmailViaBrevo(emailApiAccount.apiKey, brevoEmailData);
+        } else {
+          // Send via SMTP
+          const smtpEmailData = {
+            from: `"${project.senderName || project.senderEmail}" <${project.senderEmail}>`,
+            to: lead.email,
+            subject: personalizedSubject,
+            html: finalBody
+          };
+
+          emailResult = await sendEmailViaSMTP(transporter, smtpEmailData);
+        }
+
+        if (emailResult.success) {
+          // Save successful EmailLog and increment sent count
+          await emailLog.save();
+          sentCount++;
+
+          console.log(`Email sent via ${sendingMethod} to ${lead.email} (${sentCount}/${validLeads.length})`);
+        } else {
+          // Create failed EmailLog entry
+          emailLog.status = 'failed';
+          await emailLog.save();
+          
+          console.error(`Failed to send email via ${sendingMethod} to ${lead.email}: ${emailResult.error}`);
+        }
 
         // Update campaign progress
         campaign.sentCount = sentCount;
         await campaign.save();
-
-        console.log(`Email sent to ${lead.email} (${sentCount}/${validLeads.length})`);
 
         // Add delay between emails (1.5 seconds to avoid spam flags)
         if (sentCount < validLeads.length) {
@@ -166,7 +251,7 @@ exports.createCampaign = async (req, res) => {
         }
 
       } catch (emailError) {
-        console.error(`Failed to send email to ${lead.email}:`, emailError);
+        console.error(`Unexpected error sending email to ${lead.email}:`, emailError);
         
         // Create failed EmailLog entry
         const failedLog = new EmailLog({
@@ -192,7 +277,7 @@ exports.createCampaign = async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: `Campaign created successfully. ${sentCount}/${validLeads.length} emails sent.`,
+      message: `Campaign created successfully using ${sendingMethod.toUpperCase()}. ${sentCount}/${validLeads.length} emails sent.`,
       data: finalCampaign
     });
 

@@ -40,6 +40,16 @@ const projectSchema = new mongoose.Schema({
   smtpPassword: {
     type: String
   },
+  sendingMethod: {
+    type: String,
+    enum: ['smtp', 'brevo_api'],
+    default: 'brevo_api'
+  },
+  emailApiAccountId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'EmailApiAccount',
+    default: null
+  },
   createdAt: {
     type: Date,
     default: Date.now
