@@ -1,3 +1,4 @@
+// deploy test - 2026-10-03 12:21:00 UTC
 // DNS fix for MongoDB Atlas connection issues
 const dns = require('dns');
 dns.setServers(['8.8.8.8', '8.8.4.4']);
