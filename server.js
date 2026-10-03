@@ -59,7 +59,7 @@ app.get('/api/health', (req, res) => {
     status: 'ok', 
     message: 'Backend is running',
     timestamp: new Date().toISOString(),
-    version: '1.1.0' // Added version to trigger redeploy
+    version: '1.2.0' // Force Railway redeploy
   });
 });
 
