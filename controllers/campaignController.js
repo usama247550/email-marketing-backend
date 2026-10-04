@@ -214,6 +214,10 @@ exports.createCampaign = async (req, res) => {
             htmlContent: finalBody
           };
 
+          // Debug: Log the HTML content being sent via Brevo
+          console.log(`[BREVO DEBUG] Sending email to ${lead.email} with trackingId: ${trackingId}`);
+          console.log(`[BREVO DEBUG] HTML Content: ${finalBody}`);
+
           emailResult = await sendEmailViaBrevo(emailApiAccount.apiKey, brevoEmailData);
         } else {
           // Send via SMTP
