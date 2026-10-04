@@ -214,7 +214,10 @@ exports.createCampaign = async (req, res) => {
             htmlContent: finalBody
           };
 
-
+          // LOG THE EXACT HTML BEING SENT TO BREVO — remove after confirming pixel survives delivery
+          console.log('========== BREVO PAYLOAD htmlContent START ==========');
+          console.log(brevoEmailData.htmlContent);
+          console.log('========== BREVO PAYLOAD htmlContent END ==========');
 
           emailResult = await sendEmailViaBrevo(emailApiAccount.apiKey, brevoEmailData);
         } else {

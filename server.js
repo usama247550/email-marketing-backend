@@ -75,4 +75,14 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📊 Health check: ${process.env.PUBLIC_BACKEND_URL || `http://localhost:${PORT}`}/api/health`);
   console.log(`🌐 Allowed origins: ${allowedOrigins.join(', ')}`);
+
+  // Warn loudly if PUBLIC_BACKEND_URL is misconfigured — tracking pixels won't work
+  const publicUrl = process.env.PUBLIC_BACKEND_URL || '';
+  if (!publicUrl || publicUrl.includes('localhost') || publicUrl.includes('REPLACE_WITH')) {
+    console.warn('⚠️  WARNING: PUBLIC_BACKEND_URL is set to a localhost or placeholder value.');
+    console.warn('⚠️  Email tracking pixels will NOT work until you set it to your public Railway URL.');
+    console.warn(`⚠️  Current value: "${publicUrl}"`);
+  } else {
+    console.log(`✅ Tracking pixel base URL: ${publicUrl}`);
+  }
 });
