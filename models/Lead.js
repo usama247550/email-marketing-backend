@@ -28,10 +28,22 @@ const leadSchema = new mongoose.Schema({
     enum: ['Valid', 'Invalid', 'Unsubscribed'],
     default: 'Invalid'
   },
+  // Tracks which templates have already been emailed to this lead.
+  // Automations use this to ensure no template is ever sent twice to the same lead.
+  emailedTemplateIds: {
+    type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Template' }],
+    default: [],
+  },
   createdAt: {
     type: Date,
     default: Date.now
   }
 });
+
+// Compound index for the automation engine's lead query:
+//   find({ status: 'Valid', emailedTemplateIds: { $nin: [templateId] } })
+// MongoDB can use this index to quickly filter valid leads and then apply
+// the $nin check on the small emailedTemplateIds array per document.
+leadSchema.index({ status: 1, batchId: 1 });
 
 module.exports = mongoose.model('Lead', leadSchema);

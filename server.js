@@ -21,12 +21,22 @@ const testRoutes = require('./routes/testRoutes');
 const debugRoutes = require('./routes/debugRoutes');
 const emailApiAccountRoutes = require('./routes/emailApiAccountRoutes');
 const brevoWebhookRoutes = require('./routes/brevoWebhookRoutes');
+const automationRoutes   = require('./routes/automationRoutes');
+const { startScheduler } = require('./services/scheduler');
 
 // Load environment variables
 dotenv.config();
 
-// Connect to MongoDB
+// Connect to MongoDB, then start the automation scheduler
 connectDB();
+
+// Start the cron scheduler once Mongoose has a live connection.
+// Using the 'connected' event works whether connectDB() resolved before or
+// after this line executes (Mongoose buffers and replays the event).
+const mongoose = require('mongoose');
+mongoose.connection.once('connected', () => {
+  startScheduler();
+});
 
 const app = express();
 
@@ -54,7 +64,8 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/test', testRoutes);
 app.use('/api/debug', debugRoutes);
 app.use('/api/email-api-accounts', emailApiAccountRoutes);
-app.use('/api/webhooks', brevoWebhookRoutes);
+app.use('/api/webhooks',    brevoWebhookRoutes);
+app.use('/api/automations', automationRoutes);
 
 // Test route
 app.get('/api/health', (req, res) => {
