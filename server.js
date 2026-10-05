@@ -1,3 +1,9 @@
+// Load environment variables FIRST — before any other require() that might
+// read process.env at import time.  On Railway the vars are already in
+// process.env; dotenv.config() is a no-op there (override:false is the
+// default), so this is safe in both local and production environments.
+require('dotenv').config();
+
 // deploy test - 2026-10-03 12:21:00 UTC
 // DNS fix for MongoDB Atlas connection issues
 const dns = require('dns');
@@ -5,7 +11,6 @@ dns.setServers(['8.8.8.8', '8.8.4.4']);
 
 const express = require('express');
 const cors = require('cors');
-const dotenv = require('dotenv');
 const connectDB = require('./config/db');
 
 // Import routes
@@ -23,9 +28,6 @@ const emailApiAccountRoutes = require('./routes/emailApiAccountRoutes');
 const brevoWebhookRoutes = require('./routes/brevoWebhookRoutes');
 const automationRoutes   = require('./routes/automationRoutes');
 const { startScheduler } = require('./services/scheduler');
-
-// Load environment variables
-dotenv.config();
 
 // Connect to MongoDB, then start the automation scheduler
 connectDB();
