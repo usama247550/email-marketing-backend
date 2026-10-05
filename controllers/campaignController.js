@@ -204,6 +204,8 @@ exports.createCampaign = async (req, res) => {
 
         if (sendingMethod === 'brevo_api') {
           // Send via Brevo API
+          // The trackingId is embedded in the `tags` array so Brevo echoes it back
+          // in every webhook event payload, letting us match events to EmailLog docs.
           const brevoEmailData = {
             sender: {
               name: project.senderName || project.senderEmail,
@@ -211,13 +213,11 @@ exports.createCampaign = async (req, res) => {
             },
             to: [{ email: lead.email }],
             subject: personalizedSubject,
-            htmlContent: finalBody
+            htmlContent: finalBody,
+            // Brevo allows up to 10 tags (strings, max 50 chars each).
+            // We use a prefixed trackingId so the webhook handler can find it easily.
+            tags: [`tid_${trackingId}`]
           };
-
-          // LOG THE EXACT HTML BEING SENT TO BREVO — remove after confirming pixel survives delivery
-          console.log('========== BREVO PAYLOAD htmlContent START ==========');
-          console.log(brevoEmailData.htmlContent);
-          console.log('========== BREVO PAYLOAD htmlContent END ==========');
 
           emailResult = await sendEmailViaBrevo(emailApiAccount.apiKey, brevoEmailData);
         } else {
@@ -233,6 +233,10 @@ exports.createCampaign = async (req, res) => {
         }
 
         if (emailResult.success) {
+          // Persist the Brevo messageId for webhook correlation (Brevo API sends only)
+          if (sendingMethod === 'brevo_api' && emailResult.messageId) {
+            emailLog.brevoMessageId = emailResult.messageId;
+          }
           // Save successful EmailLog and increment sent count
           await emailLog.save();
           sentCount++;

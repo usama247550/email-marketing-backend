@@ -19,7 +19,7 @@ const emailLogSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['sent', 'failed', 'opened', 'unsubscribed'],
+    enum: ['sent', 'failed', 'opened', 'unsubscribed', 'bounced'],
     default: 'sent'
   },
   sentAt: {
@@ -32,10 +32,24 @@ const emailLogSchema = new mongoose.Schema({
   unsubscribedAt: {
     type: Date
   },
+  bouncedAt: {
+    type: Date
+  },
   trackingId: {
     type: String,
     unique: true,
     required: true
+  },
+  // Brevo's message ID returned after a successful Brevo API send.
+  // Stored so we can correlate webhook events even if the tag lookup fails.
+  brevoMessageId: {
+    type: String,
+    index: true,
+    sparse: true
+  },
+  // 'hardBounce' | 'softBounce' — populated when a bounce webhook arrives
+  bounceType: {
+    type: String
   }
 });
 
