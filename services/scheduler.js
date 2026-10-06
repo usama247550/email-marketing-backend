@@ -1,17 +1,24 @@
 /**
  * services/scheduler.js
  *
- * Every minute, checks for active Automations whose scheduledTime matches
- * the current HH:mm and that haven't already run today, then fires them.
+ * Every minute, checks for active Automations whose scheduledTime (HH:mm)
+ * matches the CURRENT TIME in the configured timezone, and that haven't
+ * already run today (in that same timezone), then fires them.
  *
- * Import and call startScheduler() once from server.js after DB connects.
+ * Timezone config
+ * ───────────────
+ * Set the SCHEDULER_TIMEZONE Railway environment variable to any IANA timezone
+ * string.  Defaults to "Asia/Karachi" (Pakistan Standard Time, UTC+5).
  *
- * Timezone note: comparison uses the server's local time (process.env.TZ or
- * the OS default). Railway sets UTC by default — set TZ in your Railway
- * environment variables if you want a different timezone (e.g. TZ=America/New_York).
+ * Examples:
+ *   SCHEDULER_TIMEZONE=Asia/Karachi        (PKT, UTC+5  — default)
+ *   SCHEDULER_TIMEZONE=America/New_York    (ET)
+ *   SCHEDULER_TIMEZONE=Europe/London       (GMT/BST)
+ *   SCHEDULER_TIMEZONE=UTC                 (no conversion)
  */
 
-const cron      = require('node-cron');
+const cron       = require('node-cron');
+const { formatInTimeZone, toZonedTime } = require('date-fns-tz');
 const Automation = require('../models/Automation');
 const { runAutomation } = require('./automationEngine');
 
@@ -19,36 +26,67 @@ const { runAutomation } = require('./automationEngine');
 const runningAutomations = new Set();
 
 const startScheduler = () => {
-  // Fires every minute: "* * * * *"
+  const TZ = process.env.SCHEDULER_TIMEZONE || 'Asia/Karachi';
+
+  // ── Startup diagnostic log ──────────────────────────────────────────────────
+  const startupNow = new Date();
+  console.log('[Scheduler] ─────────────────────────────────────────────────');
+  console.log('[Scheduler] Automation scheduler starting.');
+  console.log(`[Scheduler] Configured timezone : ${TZ}`);
+  console.log(`[Scheduler] Server UTC time     : ${startupNow.toISOString()}`);
+  console.log(`[Scheduler] Server local time   : ${startupNow.toString()}`);
+  console.log(`[Scheduler] Time in ${TZ.padEnd(20)} : ${formatInTimeZone(startupNow, TZ, 'yyyy-MM-dd HH:mm:ss zzz')}`);
+  console.log('[Scheduler] Checks run every minute. Matching against scheduledTime in', TZ);
+  console.log('[Scheduler] ─────────────────────────────────────────────────');
+
+  // ── Every-minute cron tick ──────────────────────────────────────────────────
   cron.schedule('* * * * *', async () => {
-    const now     = new Date();
-    const HH      = String(now.getHours()).padStart(2, '0');
-    const mm      = String(now.getMinutes()).padStart(2, '0');
-    const nowTime = `${HH}:${mm}`; // "09:00", "14:32", etc.
+    const nowUTC    = new Date();
 
-    // Start-of-today (midnight) for "not yet run today" check
-    const startOfToday = new Date(now);
-    startOfToday.setHours(0, 0, 0, 0);
+    // Current HH:mm in the configured timezone
+    const nowTime   = formatInTimeZone(nowUTC, TZ, 'HH:mm');
 
-    let candidates;
+    // "Start of today" in the configured timezone — used for the "not yet run
+    // today" guard.  We build a zoned Date at midnight in TZ, then convert to
+    // the UTC instant that represents that midnight.
+    const zonedNow       = toZonedTime(nowUTC, TZ);
+    const startOfTodayTZ = new Date(zonedNow);
+    startOfTodayTZ.setHours(0, 0, 0, 0);
+    // Convert back to UTC for the MongoDB query
+    const startOfTodayUTC = new Date(
+      startOfTodayTZ.getTime() - (zonedNow.getTimezoneOffset() * 60 * 1000)
+    );
+
+    // ── Per-tick diagnostic log (always printed so you can watch in Railway) ──
+    let activeAutomations;
     try {
-      candidates = await Automation.find({
-        status:        'active',
-        scheduledTime: nowTime,
-        $or: [
-          { lastRunAt: { $lt: startOfToday } }, // ran before today
-          { lastRunAt: { $exists: false }     }, // never run
-          { lastRunAt: null                   }, // explicitly null
-        ],
-      });
+      activeAutomations = await Automation.find({ status: 'active' }, 'name scheduledTime lastRunAt');
     } catch (err) {
       console.error('[Scheduler] Error querying automations:', err.message);
       return;
     }
 
+    if (activeAutomations.length === 0) {
+      console.log(`[Scheduler] ${nowTime} ${TZ} | server UTC: ${nowUTC.toISOString()} | no active automations.`);
+      return;
+    }
+
+    // Log current time + every active automation's scheduled time for visibility
+    const summary = activeAutomations
+      .map(a => `"${a.name}" @ ${a.scheduledTime}${a.scheduledTime === nowTime ? ' ← MATCH' : ''}`)
+      .join(' | ');
+    console.log(`[Scheduler] ${nowTime} ${TZ} | UTC: ${nowUTC.toISOString()} | active: ${summary}`);
+
+    // ── Find automations whose scheduledTime matches now and haven't run today ─
+    const candidates = activeAutomations.filter(a => {
+      if (a.scheduledTime !== nowTime) return false;
+      if (!a.lastRunAt) return true;                                  // never run
+      return new Date(a.lastRunAt) < startOfTodayUTC;                // ran before today (in TZ)
+    });
+
     if (candidates.length === 0) return;
 
-    console.log(`[Scheduler] ${nowTime} — found ${candidates.length} automation(s) to run.`);
+    console.log(`[Scheduler] → ${candidates.length} automation(s) to fire: ${candidates.map(a => `"${a.name}"`).join(', ')}`);
 
     for (const automation of candidates) {
       const id = automation._id.toString();
@@ -60,8 +98,6 @@ const startScheduler = () => {
 
       runningAutomations.add(id);
 
-      // Fire-and-forget: don't await so the cron tick returns quickly.
-      // Errors are caught inside runAutomation already, but we add a safety net.
       runAutomation(id)
         .catch((err) => {
           console.error(`[Scheduler] Unhandled error in automation "${automation.name}":`, err.message);
@@ -71,8 +107,6 @@ const startScheduler = () => {
         });
     }
   });
-
-  console.log('[Scheduler] Automation scheduler started (checks every minute).');
 };
 
 module.exports = { startScheduler };
