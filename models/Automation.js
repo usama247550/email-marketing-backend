@@ -39,6 +39,13 @@ const automationSchema = new mongoose.Schema({
     type: Number,
     default: 0,
   },
+  // Set when the automation is auto-paused because its linked Project or
+  // Template was deleted.  Cleared when the user updates the automation with
+  // a valid replacement.
+  orphanReason: {
+    type: String,
+    default: null,
+  },
   createdAt: {
     type: Date,
     default: Date.now,

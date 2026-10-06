@@ -1,4 +1,5 @@
-const Project = require('../models/Project');
+const Project    = require('../models/Project');
+const Automation = require('../models/Automation');
 
 // @desc    Get all projects
 // @route   GET /api/projects
@@ -27,7 +28,7 @@ const getAllProjects = async (req, res) => {
 const getProjectById = async (req, res) => {
   try {
     const project = await Project.findById(req.params.id);
-    
+
     if (!project) {
       return res.status(404).json({
         success: false,
@@ -41,15 +42,12 @@ const getProjectById = async (req, res) => {
     });
   } catch (error) {
     console.error('Error in getProjectById:', error);
-    
-    // Handle invalid ObjectId
     if (error.name === 'CastError') {
       return res.status(400).json({
         success: false,
         message: 'Invalid project ID format'
       });
     }
-
     res.status(500).json({
       success: false,
       message: 'Server error while fetching project',
@@ -64,7 +62,7 @@ const getProjectById = async (req, res) => {
 const createProject = async (req, res) => {
   try {
     const project = await Project.create(req.body);
-    
+
     res.status(201).json({
       success: true,
       message: 'Project created successfully',
@@ -72,8 +70,6 @@ const createProject = async (req, res) => {
     });
   } catch (error) {
     console.error('Error in createProject:', error);
-    
-    // Handle validation errors
     if (error.name === 'ValidationError') {
       const messages = Object.values(error.errors).map(err => err.message);
       return res.status(400).json({
@@ -82,7 +78,6 @@ const createProject = async (req, res) => {
         errors: messages
       });
     }
-
     res.status(500).json({
       success: false,
       message: 'Server error while creating project',
@@ -99,10 +94,7 @@ const updateProject = async (req, res) => {
     const project = await Project.findByIdAndUpdate(
       req.params.id,
       req.body,
-      {
-        new: true, // Return updated document
-        runValidators: true // Run schema validation
-      }
+      { new: true, runValidators: true }
     );
 
     if (!project) {
@@ -119,16 +111,12 @@ const updateProject = async (req, res) => {
     });
   } catch (error) {
     console.error('Error in updateProject:', error);
-    
-    // Handle invalid ObjectId
     if (error.name === 'CastError') {
       return res.status(400).json({
         success: false,
         message: 'Invalid project ID format'
       });
     }
-
-    // Handle validation errors
     if (error.name === 'ValidationError') {
       const messages = Object.values(error.errors).map(err => err.message);
       return res.status(400).json({
@@ -137,7 +125,6 @@ const updateProject = async (req, res) => {
         errors: messages
       });
     }
-
     res.status(500).json({
       success: false,
       message: 'Server error while updating project',
@@ -160,6 +147,21 @@ const deleteProject = async (req, res) => {
       });
     }
 
+    // Cascade: pause any automations that referenced this project.
+    // We pause (not delete) so configs are recoverable.
+    const affected = await Automation.updateMany(
+      { projectId: req.params.id },
+      {
+        status: 'paused',
+        orphanReason: `Project "${project.name}" was deleted`,
+      }
+    );
+    if (affected.modifiedCount > 0) {
+      console.log(
+        `[deleteProject] Auto-paused ${affected.modifiedCount} automation(s) that referenced project "${project.name}"`
+      );
+    }
+
     res.status(200).json({
       success: true,
       message: 'Project deleted successfully',
@@ -167,15 +169,12 @@ const deleteProject = async (req, res) => {
     });
   } catch (error) {
     console.error('Error in deleteProject:', error);
-    
-    // Handle invalid ObjectId
     if (error.name === 'CastError') {
       return res.status(400).json({
         success: false,
         message: 'Invalid project ID format'
       });
     }
-
     res.status(500).json({
       success: false,
       message: 'Server error while deleting project',

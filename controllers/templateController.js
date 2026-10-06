@@ -1,4 +1,5 @@
-const Template = require('../models/Template');
+const Template   = require('../models/Template');
+const Automation = require('../models/Automation');
 
 // @desc    Get all templates
 // @route   GET /api/templates
@@ -27,7 +28,7 @@ const getAllTemplates = async (req, res) => {
 const getTemplateById = async (req, res) => {
   try {
     const template = await Template.findById(req.params.id);
-    
+
     if (!template) {
       return res.status(404).json({
         success: false,
@@ -41,15 +42,12 @@ const getTemplateById = async (req, res) => {
     });
   } catch (error) {
     console.error('Error in getTemplateById:', error);
-    
-    // Handle invalid ObjectId
     if (error.name === 'CastError') {
       return res.status(400).json({
         success: false,
         message: 'Invalid template ID format'
       });
     }
-
     res.status(500).json({
       success: false,
       message: 'Server error while fetching template',
@@ -64,7 +62,7 @@ const getTemplateById = async (req, res) => {
 const createTemplate = async (req, res) => {
   try {
     const template = await Template.create(req.body);
-    
+
     res.status(201).json({
       success: true,
       message: 'Template created successfully',
@@ -72,8 +70,6 @@ const createTemplate = async (req, res) => {
     });
   } catch (error) {
     console.error('Error in createTemplate:', error);
-    
-    // Handle validation errors
     if (error.name === 'ValidationError') {
       const messages = Object.values(error.errors).map(err => err.message);
       return res.status(400).json({
@@ -82,7 +78,6 @@ const createTemplate = async (req, res) => {
         errors: messages
       });
     }
-
     res.status(500).json({
       success: false,
       message: 'Server error while creating template',
@@ -99,10 +94,7 @@ const updateTemplate = async (req, res) => {
     const template = await Template.findByIdAndUpdate(
       req.params.id,
       req.body,
-      {
-        new: true, // Return updated document
-        runValidators: true // Run schema validation
-      }
+      { new: true, runValidators: true }
     );
 
     if (!template) {
@@ -119,16 +111,12 @@ const updateTemplate = async (req, res) => {
     });
   } catch (error) {
     console.error('Error in updateTemplate:', error);
-    
-    // Handle invalid ObjectId
     if (error.name === 'CastError') {
       return res.status(400).json({
         success: false,
         message: 'Invalid template ID format'
       });
     }
-
-    // Handle validation errors
     if (error.name === 'ValidationError') {
       const messages = Object.values(error.errors).map(err => err.message);
       return res.status(400).json({
@@ -137,7 +125,6 @@ const updateTemplate = async (req, res) => {
         errors: messages
       });
     }
-
     res.status(500).json({
       success: false,
       message: 'Server error while updating template',
@@ -160,6 +147,21 @@ const deleteTemplate = async (req, res) => {
       });
     }
 
+    // Cascade: pause any automations that referenced this template.
+    // We pause (not delete) so configs are recoverable.
+    const affected = await Automation.updateMany(
+      { templateId: req.params.id },
+      {
+        status: 'paused',
+        orphanReason: `Template "${template.name}" was deleted`,
+      }
+    );
+    if (affected.modifiedCount > 0) {
+      console.log(
+        `[deleteTemplate] Auto-paused ${affected.modifiedCount} automation(s) that referenced template "${template.name}"`
+      );
+    }
+
     res.status(200).json({
       success: true,
       message: 'Template deleted successfully',
@@ -167,15 +169,12 @@ const deleteTemplate = async (req, res) => {
     });
   } catch (error) {
     console.error('Error in deleteTemplate:', error);
-    
-    // Handle invalid ObjectId
     if (error.name === 'CastError') {
       return res.status(400).json({
         success: false,
         message: 'Invalid template ID format'
       });
     }
-
     res.status(500).json({
       success: false,
       message: 'Server error while deleting template',
