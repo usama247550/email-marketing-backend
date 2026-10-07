@@ -28,6 +28,12 @@ const leadSchema = new mongoose.Schema({
     enum: ['Valid', 'Invalid', 'Unsubscribed'],
     default: 'Invalid'
   },
+  // Which niche this lead was found under (set by Lead Finder Agent)
+  niche: {
+    type: String,
+    trim: true,
+    default: ''
+  },
   // Tracks which templates have already been emailed to this lead.
   // Automations use this to ensure no template is ever sent twice to the same lead.
   emailedTemplateIds: {

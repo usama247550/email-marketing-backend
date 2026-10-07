@@ -27,6 +27,7 @@ const debugRoutes = require('./routes/debugRoutes');
 const emailApiAccountRoutes = require('./routes/emailApiAccountRoutes');
 const brevoWebhookRoutes = require('./routes/brevoWebhookRoutes');
 const automationRoutes   = require('./routes/automationRoutes');
+const leadFinderRoutes   = require('./routes/leadFinderRoutes');
 const { startScheduler } = require('./services/scheduler');
 
 // Connect to MongoDB, then start the automation scheduler
@@ -68,6 +69,7 @@ app.use('/api/debug', debugRoutes);
 app.use('/api/email-api-accounts', emailApiAccountRoutes);
 app.use('/api/webhooks',    brevoWebhookRoutes);
 app.use('/api/automations', automationRoutes);
+app.use('/api/lead-finder', leadFinderRoutes);
 
 // Test route
 app.get('/api/health', (req, res) => {
