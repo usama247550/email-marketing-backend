@@ -52,4 +52,8 @@ const leadSchema = new mongoose.Schema({
 // the $nin check on the small emailedTemplateIds array per document.
 leadSchema.index({ status: 1, batchId: 1 });
 
+// Index for fast email-scoped-to-project deduplication in the Lead Finder.
+// Usage: Lead.find({ batchId: { $in: projectBatchIds }, email: '...' })
+leadSchema.index({ email: 1, batchId: 1 });
+
 module.exports = mongoose.model('Lead', leadSchema);
