@@ -56,6 +56,9 @@ const LOCAL_PART_BLACKLIST = [
   /\d{6,}/,
 ];
 
+// TLDs that are actually image/media file extensions misidentified as emails
+const FAKE_TLDS = new Set(['png','jpg','jpeg','gif','svg','webp','css','js','woff','woff2','ttf','eot','ico','pdf','mp4','mp3','zip','xml','json']);
+
 const DOMAIN_BLACKLIST = [
   'example.com', 'example.org', 'example.net',
   'sentry.io', 'wixpress.com', 'githubusercontent.com',
@@ -99,6 +102,9 @@ function isUsableEmail(email) {
   const [local, domain] = lower.split('@');
   if (DOMAIN_BLACKLIST.includes(domain)) return false;
   for (const p of LOCAL_PART_BLACKLIST) if (p.test(local)) return false;
+  // Reject if the TLD is actually a media/asset file extension (e.g. flags@2x.webp)
+  const tld = domain.split('.').pop();
+  if (FAKE_TLDS.has(tld)) return false;
   return true;
 }
 
@@ -566,4 +572,19 @@ const runMultiNicheSearch = async ({
   return summary;
 };
 
-module.exports = { runMultiNicheSearch };
+module.exports = {
+  runMultiNicheSearch,
+  // ── Shared helpers used by smartSearchService ───────────────────────────
+  // Exported so the Smart Search pipeline can reuse TomTom + scraping logic
+  // without duplicating code.
+  searchTomTom,
+  parseTomTomResult,
+  scrapeWebsiteForEmail,
+  runInBatches,
+  normaliseUrl,
+  sleep,
+  HARD_CAP_PER_NICHE,
+  TOMTOM_CALL_DELAY_MS,
+  TOMTOM_PAGE_SIZE,
+  OVERFETCH_RATIO,
+};

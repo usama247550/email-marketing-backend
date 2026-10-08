@@ -34,6 +34,12 @@ const leadSchema = new mongoose.Schema({
     trim: true,
     default: ''
   },
+  // Why the AI decided this lead matches the search criteria (Smart Search only)
+  matchReason: {
+    type: String,
+    trim: true,
+    default: ''
+  },
   // Tracks which templates have already been emailed to this lead.
   // Automations use this to ensure no template is ever sent twice to the same lead.
   emailedTemplateIds: {
