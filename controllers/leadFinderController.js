@@ -3,50 +3,30 @@
  *
  * Async job pattern — shared by Multi-Niche Search and Smart Search.
  *
- * All searches share ONE in-memory job store (Map).  Each job has a `type`
- * field so the status endpoint can return the right fields for each job type.
+ * Multi-Niche job lifecycle:
+ *   POST /multi-niche-search          → creates job, fires background pipeline, 202
+ *   POST /multi-niche-search/:id/stop → sets cancelFlag, pipeline finishes current round
+ *   GET  /status/:id                  → returns live progress, rounds, batchId, savedSoFar
  *
- * Job lifecycle:
- *   POST trigger  → creates job, fires background function, responds 202 immediately
- *   GET  status   → returns current job state including live progress
- *   POST save     → (Smart Search only) saves matched leads to a new Batch in MongoDB
- *
- * The background function never touches Express req/res — it only mutates the
- * in-memory job object via the updateJob / onProgress callbacks.
+ * Smart Search job lifecycle: unchanged.
+ *   POST /smart-search                → creates job, fires pipeline, 202
+ *   POST /smart-search/:id/stop       → sets cancelFlag
+ *   POST /smart-search/:id/save       → saves matched/rejected leads to batch
+ *   GET  /status/:id                  → returns stage, results, summary, rejected
  */
 
 'use strict';
 
-const { randomUUID }           = require('crypto');
-const { runMultiNicheSearch }  = require('../services/leadFinderService');
-const { runSmartSearch }       = require('../services/smartSearchService');
-const Batch                    = require('../models/Batch');
-const Lead                     = require('../models/Lead');
+const { randomUUID }          = require('crypto');
+const { runMultiNicheSearch } = require('../services/leadFinderService');
+const { runSmartSearch }      = require('../services/smartSearchService');
+const Batch                   = require('../models/Batch');
+const Lead                    = require('../models/Lead');
 
 // ── In-memory job store ───────────────────────────────────────────────────────
-// Map<jobId, JobRecord>
-//
-// JobRecord (shared fields)
-//   type:        'multi_niche' | 'smart'
-//   status:      'running' | 'done' | 'error'
-//   startedAt:   ISO string
-//   finishedAt:  ISO string | null
-//   params:      original request params (varies by type)
-//   progress:    live counters object (varies by type)
-//   result:      final summary (multi_niche only)
-//   error:       string | null
-//   saved:       boolean (smart only — prevents double-save)
-//   _runKey:     internal dedup key
-//   _jobId:      echo of Map key
-//
-// Smart-specific extra fields:
-//   stage:       'analyzing' | 'searching' | 'checking' | 'filtering' | 'completed'
-//   parsedParams: { country, city, niche, criteria, leadsCount }
-//   results:     Array<{ company, city, website, email, niche, reason }>
-//   summary:     { candidatesFound, checked, withEmail, matched, stoppedEarlyReason }
 
-const jobs = new Map();
-const JOB_TTL_MS = 30 * 60 * 1000;  // keep finished jobs 30 minutes
+const jobs   = new Map();
+const JOB_TTL_MS = 30 * 60 * 1000;
 
 function scheduleCleanup(jobId) {
   setTimeout(() => jobs.delete(jobId), JOB_TTL_MS);
@@ -64,21 +44,25 @@ function buildResponse(job) {
     progress:   job.progress,
   };
 
-  if (job.type === 'smart') {
+  if (job.type === 'multi_niche') {
+    // Always expose live fields
+    base.savedSoFar = job.savedSoFar;
+    base.rounds     = job.rounds;
+    if (job.batchId) base.batchId = job.batchId;
+    if (job.batchName) base.batchName = job.batchName;
+    if (job.status === 'done')  base.result = job.result;
+    if (job.status === 'error') base.error  = job.error;
+  } else {
+    // smart
     base.stage        = job.stage;
     base.parsedParams = job.parsedParams;
-    // Expose partial results while running so frontend can show progressive leads
     if (job.results !== null) base.results = job.results;
-    // Expose rejected candidates only when done (they're only populated after filtering)
     if (job.status === 'done') {
       base.summary  = job.summary;
       base.rejected = job.rejected || [];
     }
-    if (job.status === 'error')   base.error = job.error;
-    if (job.saved)                base.saved  = true;
-  } else {
-    if (job.status === 'done')   base.result = job.result;
-    if (job.status === 'error')  base.error  = job.error;
+    if (job.status === 'error') base.error = job.error;
+    if (job.saved) base.saved = true;
   }
 
   return base;
@@ -125,37 +109,78 @@ const triggerMultiNicheSearch = async (req, res) => {
   const runKey = `multi|${projectId}|${[...niches].sort().join(',')}|${city}`;
   for (const [, existing] of jobs) {
     if (existing.status === 'running' && existing._runKey === runKey)
-      return res.status(409).json({ error: 'A search with the same parameters is already running.', jobId: existing._jobId });
+      return res.status(409).json({
+        error: 'A search with the same parameters is already running.',
+        jobId: existing._jobId,
+      });
   }
 
-  const jobId = randomUUID();
+  const jobId      = randomUUID();
+  const cancelFlag = { cancelled: false };
+
   const job = {
-    type:       'multi_niche',
-    status:     'running',
-    startedAt:  new Date().toISOString(),
-    finishedAt: null,
-    result:     null,
-    error:      null,
-    _runKey:    runKey,
-    _jobId:     jobId,
-    params:     { projectId, country, city, niches, totalLeads },
-    progress:   { checked: 0, validFound: 0, target: totalLeads, currentNiche: niches[0] ?? '' },
+    type:        'multi_niche',
+    status:      'running',
+    startedAt:   new Date().toISOString(),
+    finishedAt:  null,
+    result:      null,
+    error:       null,
+    savedSoFar:  0,
+    rounds:      [],
+    batchId:     null,
+    batchName:   null,
+    _runKey:     runKey,
+    _jobId:      jobId,
+    _cancelFlag: cancelFlag,
+    params:      { projectId, country, city, niches, totalLeads },
+    progress:    {
+      round: 0, phase: 'starting',
+      currentNiche: niches[0] ?? '',
+      savedSoFar: 0, target: totalLeads,
+      roundCandidates: 0, roundScraped: 0, roundValid: 0,
+    },
   };
   jobs.set(jobId, job);
 
-  const onProgress = ({ checked, validFound, currentNiche }) => {
-    job.progress.checked      = checked;
-    job.progress.validFound   = validFound;
-    job.progress.currentNiche = currentNiche;
+  // Callbacks the pipeline calls back into the job record
+  const onProgress = (p) => {
+    job.progress = {
+      round:           p.round           ?? job.progress.round,
+      phase:           p.collecting ? 'collecting' : p.scraping ? 'scraping' : job.progress.phase,
+      currentNiche:    p.niche            ?? job.progress.currentNiche,
+      savedSoFar:      p.totalSaved       ?? job.savedSoFar,
+      target:          totalLeads,
+      roundCandidates: p.roundCandidates  ?? job.progress.roundCandidates,
+      roundScraped:    p.roundScraped     ?? job.progress.roundScraped,
+      roundValid:      p.roundValid       ?? job.progress.roundValid,
+    };
+    job.savedSoFar = job.progress.savedSoFar;
   };
 
-  runMultiNicheSearch({ projectId, country, city, niches, totalLeads, onProgress })
+  const onBatchCreated = (bId, bName) => {
+    job.batchId   = bId;
+    job.batchName = bName;
+  };
+
+  const onRoundDone = (stats) => {
+    job.rounds     = [...job.rounds, stats];
+    job.savedSoFar = stats.saved;
+    job.progress.savedSoFar = stats.saved;
+    job.progress.round = stats.round;
+    job.progress.phase = 'round_done';
+  };
+
+  runMultiNicheSearch({
+    projectId, country, city, niches, totalLeads,
+    onProgress, cancelFlag, onBatchCreated, onRoundDone,
+  })
     .then((result) => {
       job.status     = 'done';
       job.finishedAt = new Date().toISOString();
       job.result     = result;
-      job.progress.checked    = result.checkedCount;
-      job.progress.validFound = result.validCount;
+      job.savedSoFar = result.totalFound;
+      job.batchId    = result.batchId || job.batchId;
+      job.batchName  = result.batchName || job.batchName;
       scheduleCleanup(jobId);
     })
     .catch((err) => {
@@ -173,11 +198,31 @@ const triggerMultiNicheSearch = async (req, res) => {
   });
 };
 
+// ── POST /api/lead-finder/multi-niche-search/:jobId/stop ─────────────────────
+
+const cancelMultiNicheSearch = (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job)
+    return res.status(404).json({ error: 'Job not found or expired.' });
+  if (job.type !== 'multi_niche')
+    return res.status(400).json({ error: 'Only Multi-Niche Search jobs can be stopped with this endpoint.' });
+  if (job.status !== 'running')
+    return res.status(400).json({ error: `Job is already ${job.status}.` });
+
+  job._cancelFlag.cancelled = true;
+  console.log(`[LeadFinder] Cancel requested for multi-niche job ${req.params.jobId}`);
+  return res.json({
+    success: true,
+    message: 'Stop signal sent. The job will finish its current scrape batch, save found leads, and complete.',
+    savedSoFar: job.savedSoFar,
+    batchId:    job.batchId,
+  });
+};
+
 // ── POST /api/lead-finder/smart-search ───────────────────────────────────────
 
 const triggerSmartSearch = async (req, res) => {
   const { projectId, instructionText } = req.body;
-  // leadsCount and strictness come from the request body (not the AI)
   const leadsCount = Number.isInteger(req.body.leadsCount) && req.body.leadsCount >= 5 && req.body.leadsCount <= 100
     ? req.body.leadsCount : 20;
   const strictness = ['strict', 'normal', 'loose'].includes(req.body.strictness)
@@ -191,15 +236,16 @@ const triggerSmartSearch = async (req, res) => {
 
   if (errors.length > 0) return res.status(400).json({ error: 'Validation failed', details: errors });
 
-  // Duplicate-run guard
   const runKey = `smart|${projectId}|${instructionText.trim().toLowerCase().slice(0, 100)}`;
   for (const [, existing] of jobs) {
     if (existing.status === 'running' && existing._runKey === runKey)
-      return res.status(409).json({ error: 'A smart search with the same instruction is already running.', jobId: existing._jobId });
+      return res.status(409).json({
+        error: 'A smart search with the same instruction is already running.',
+        jobId: existing._jobId,
+      });
   }
 
-  const jobId = randomUUID();
-  // cancelFlag is a shared mutable object; the pipeline checks it between batches
+  const jobId      = randomUUID();
   const cancelFlag = { cancelled: false };
 
   const job = {
@@ -257,8 +303,8 @@ const triggerSmartSearch = async (req, res) => {
 // ── POST /api/lead-finder/smart-search/:jobId/save ────────────────────────────
 
 const saveSmartSearchResults = async (req, res) => {
-  const { jobId }         = req.params;
-  const { selectedEmails } = req.body;  // optional array; may include emails from results OR rejected
+  const { jobId }          = req.params;
+  const { selectedEmails } = req.body;
 
   const job = jobs.get(jobId);
   if (!job)
@@ -270,7 +316,6 @@ const saveSmartSearchResults = async (req, res) => {
   if (job.saved)
     return res.status(409).json({ error: 'This job has already been saved to a batch.' });
 
-  // Build a combined pool: matched leads + rejected leads
   const allLeads = [
     ...(job.results  || []).map(l => ({ ...l, _fromRejected: false })),
     ...(job.rejected || []).map(l => ({ ...l, _fromRejected: true  })),
@@ -279,31 +324,26 @@ const saveSmartSearchResults = async (req, res) => {
   if (allLeads.length === 0)
     return res.status(400).json({ error: 'No results to save.' });
 
-  // Determine which leads to save
   let leadsToSave;
   if (Array.isArray(selectedEmails) && selectedEmails.length > 0) {
     const emailSet = new Set(selectedEmails.map(e => e.toLowerCase().trim()));
     leadsToSave = allLeads.filter(l => emailSet.has(l.email.toLowerCase().trim()));
   } else {
-    // Default: save all matched (not rejected) leads
     leadsToSave = allLeads.filter(l => !l._fromRejected);
   }
 
   if (leadsToSave.length === 0)
     return res.status(400).json({ error: 'None of the selected emails matched the job results.' });
 
-  // Build batch name: "Smart: {niche} - {country/city} - {date}"
-  const pp     = job.parsedParams || {};
-  const loc    = pp.city ? `${pp.city}, ${pp.country}` : pp.country || 'Unknown';
+  const pp      = job.parsedParams || {};
+  const loc     = pp.city ? `${pp.city}, ${pp.country}` : pp.country || 'Unknown';
   const dateStr = new Date().toISOString().slice(0, 10);
   const batchName = `Smart: ${pp.niche || 'search'} - ${loc} - ${dateStr}`;
 
   try {
     const batch = new Batch({
-      name:      batchName,
-      projectId: job.params.projectId,
-      source:    'Lead Finder Agent',
-      leadCount: leadsToSave.length,
+      name: batchName, projectId: job.params.projectId,
+      source: 'Lead Finder Agent', leadCount: leadsToSave.length,
     });
     await batch.save();
 
@@ -319,14 +359,10 @@ const saveSmartSearchResults = async (req, res) => {
     })));
 
     job.saved = true;
-
     console.log(`[SmartSearch] Saved ${leadsToSave.length} leads to batch "${batchName}" (${batch._id})`);
 
     return res.json({
-      success:    true,
-      batchId:    batch._id,
-      batchName,
-      savedCount: leadsToSave.length,
+      success: true, batchId: batch._id, batchName, savedCount: leadsToSave.length,
     });
   } catch (err) {
     console.error('[SmartSearch] Save error:', err.message);
@@ -341,13 +377,23 @@ const cancelSmartSearch = (req, res) => {
   if (!job)
     return res.status(404).json({ error: 'Job not found or expired.' });
   if (job.type !== 'smart')
-    return res.status(400).json({ error: 'Only Smart Search jobs can be stopped.' });
+    return res.status(400).json({ error: 'Only Smart Search jobs can be stopped with this endpoint.' });
   if (job.status !== 'running')
     return res.status(400).json({ error: `Job is already ${job.status}.` });
 
   job._cancelFlag.cancelled = true;
   console.log(`[SmartSearch] Cancel requested for job ${req.params.jobId}`);
-  return res.json({ success: true, message: 'Stop signal sent. The job will finish its current batch and complete.' });
+  return res.json({
+    success: true,
+    message: 'Stop signal sent. The job will finish its current batch and complete.',
+  });
 };
 
-module.exports = { triggerMultiNicheSearch, triggerSmartSearch, cancelSmartSearch, saveSmartSearchResults, getJobStatus };
+module.exports = {
+  triggerMultiNicheSearch,
+  cancelMultiNicheSearch,
+  triggerSmartSearch,
+  cancelSmartSearch,
+  saveSmartSearchResults,
+  getJobStatus,
+};
