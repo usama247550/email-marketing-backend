@@ -65,15 +65,20 @@ function buildResponse(job) {
   };
 
   if (job.type === 'smart') {
-    base.stage       = job.stage;
+    base.stage        = job.stage;
     base.parsedParams = job.parsedParams;
-    if (job.status === 'done')   { base.results = job.results;  base.summary = job.summary; }
-    if (job.status === 'error')    base.error   = job.error;
-    if (job.saved)                 base.saved   = true;
+    // Expose partial results while running so frontend can show progressive leads
+    if (job.results !== null) base.results = job.results;
+    // Expose rejected candidates only when done (they're only populated after filtering)
+    if (job.status === 'done') {
+      base.summary  = job.summary;
+      base.rejected = job.rejected || [];
+    }
+    if (job.status === 'error')   base.error = job.error;
+    if (job.saved)                base.saved  = true;
   } else {
-    // multi_niche
-    if (job.status === 'done')   base.result  = job.result;
-    if (job.status === 'error')  base.error   = job.error;
+    if (job.status === 'done')   base.result = job.result;
+    if (job.status === 'error')  base.error  = job.error;
   }
 
   return base;
@@ -172,6 +177,11 @@ const triggerMultiNicheSearch = async (req, res) => {
 
 const triggerSmartSearch = async (req, res) => {
   const { projectId, instructionText } = req.body;
+  // leadsCount and strictness come from the request body (not the AI)
+  const leadsCount = Number.isInteger(req.body.leadsCount) && req.body.leadsCount >= 5 && req.body.leadsCount <= 100
+    ? req.body.leadsCount : 20;
+  const strictness = ['strict', 'normal', 'loose'].includes(req.body.strictness)
+    ? req.body.strictness : 'normal';
 
   const errors = [];
   if (!projectId || typeof projectId !== 'string' || !projectId.trim())
@@ -181,7 +191,7 @@ const triggerSmartSearch = async (req, res) => {
 
   if (errors.length > 0) return res.status(400).json({ error: 'Validation failed', details: errors });
 
-  // Duplicate-run guard (per projectId + instruction)
+  // Duplicate-run guard
   const runKey = `smart|${projectId}|${instructionText.trim().toLowerCase().slice(0, 100)}`;
   for (const [, existing] of jobs) {
     if (existing.status === 'running' && existing._runKey === runKey)
@@ -189,6 +199,9 @@ const triggerSmartSearch = async (req, res) => {
   }
 
   const jobId = randomUUID();
+  // cancelFlag is a shared mutable object; the pipeline checks it between batches
+  const cancelFlag = { cancelled: false };
+
   const job = {
     type:         'smart',
     status:       'running',
@@ -198,25 +211,27 @@ const triggerSmartSearch = async (req, res) => {
     saved:        false,
     _runKey:      runKey,
     _jobId:       jobId,
-    params:       { projectId, instructionText: instructionText.trim() },
+    _cancelFlag:  cancelFlag,
+    params:       { projectId, instructionText: instructionText.trim(), leadsCount, strictness },
     stage:        'analyzing',
     parsedParams: null,
     results:      null,
+    rejected:     [],
     summary:      null,
     progress:     { stage: 'analyzing', detail: 'Starting…' },
   };
   jobs.set(jobId, job);
 
-  // updateJob callback: smartSearchService calls this to report live state
-  const updateJob = ({ stage, progress, parsedParams, results, summary } = {}) => {
+  const updateJob = ({ stage, progress, parsedParams, results, rejected, summary } = {}) => {
     if (stage        !== undefined) job.stage        = stage;
     if (progress     !== undefined) job.progress     = progress;
     if (parsedParams !== undefined) job.parsedParams = parsedParams;
     if (results      !== undefined) job.results      = results;
+    if (rejected     !== undefined) job.rejected     = rejected;
     if (summary      !== undefined) job.summary      = summary;
   };
 
-  runSmartSearch({ projectId, instructionText: instructionText.trim(), updateJob })
+  runSmartSearch({ projectId, instructionText: instructionText.trim(), leadsCount, strictness, updateJob, cancelFlag })
     .then(() => {
       job.status     = 'done';
       job.stage      = 'completed';
@@ -243,7 +258,7 @@ const triggerSmartSearch = async (req, res) => {
 
 const saveSmartSearchResults = async (req, res) => {
   const { jobId }         = req.params;
-  const { selectedEmails } = req.body;  // optional array; if omitted, save ALL matched leads
+  const { selectedEmails } = req.body;  // optional array; may include emails from results OR rejected
 
   const job = jobs.get(jobId);
   if (!job)
@@ -254,14 +269,24 @@ const saveSmartSearchResults = async (req, res) => {
     return res.status(400).json({ error: `Job is not completed yet (current status: ${job.status}).` });
   if (job.saved)
     return res.status(409).json({ error: 'This job has already been saved to a batch.' });
-  if (!job.results || job.results.length === 0)
+
+  // Build a combined pool: matched leads + rejected leads
+  const allLeads = [
+    ...(job.results  || []).map(l => ({ ...l, _fromRejected: false })),
+    ...(job.rejected || []).map(l => ({ ...l, _fromRejected: true  })),
+  ];
+
+  if (allLeads.length === 0)
     return res.status(400).json({ error: 'No results to save.' });
 
   // Determine which leads to save
-  let leadsToSave = job.results;
+  let leadsToSave;
   if (Array.isArray(selectedEmails) && selectedEmails.length > 0) {
     const emailSet = new Set(selectedEmails.map(e => e.toLowerCase().trim()));
-    leadsToSave = job.results.filter(l => emailSet.has(l.email.toLowerCase().trim()));
+    leadsToSave = allLeads.filter(l => emailSet.has(l.email.toLowerCase().trim()));
+  } else {
+    // Default: save all matched (not rejected) leads
+    leadsToSave = allLeads.filter(l => !l._fromRejected);
   }
 
   if (leadsToSave.length === 0)
@@ -289,7 +314,7 @@ const saveSmartSearchResults = async (req, res) => {
       website:     l.website || '',
       email:       l.email,
       niche:       l.niche || pp.niche || '',
-      matchReason: l.reason || '',
+      matchReason: l._fromRejected ? `Manually added: ${l.reason || ''}` : (l.reason || ''),
       status:      'Valid',
     })));
 
@@ -309,4 +334,20 @@ const saveSmartSearchResults = async (req, res) => {
   }
 };
 
-module.exports = { triggerMultiNicheSearch, triggerSmartSearch, saveSmartSearchResults, getJobStatus };
+// ── POST /api/lead-finder/smart-search/:jobId/stop ────────────────────────────
+
+const cancelSmartSearch = (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job)
+    return res.status(404).json({ error: 'Job not found or expired.' });
+  if (job.type !== 'smart')
+    return res.status(400).json({ error: 'Only Smart Search jobs can be stopped.' });
+  if (job.status !== 'running')
+    return res.status(400).json({ error: `Job is already ${job.status}.` });
+
+  job._cancelFlag.cancelled = true;
+  console.log(`[SmartSearch] Cancel requested for job ${req.params.jobId}`);
+  return res.json({ success: true, message: 'Stop signal sent. The job will finish its current batch and complete.' });
+};
+
+module.exports = { triggerMultiNicheSearch, triggerSmartSearch, cancelSmartSearch, saveSmartSearchResults, getJobStatus };
