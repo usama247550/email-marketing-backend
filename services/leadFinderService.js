@@ -491,6 +491,8 @@ async function collectForNiche({ niche, city, country, poolTarget, seenDomains, 
 
     let results, rl, exh;
 
+    let isExh = false;
+
     if (isAllCitiesGermany) {
       // Cycle through German cities
       const cityEntry = GERMANY_CITIES[nicheState.cityIdx % GERMANY_CITIES.length];
@@ -504,11 +506,11 @@ async function collectForNiche({ niche, city, country, poolTarget, seenDomains, 
         nicheState.cityIdx++;
         nicheState.offset = 0;
         if (nicheState.cityIdx >= GERMANY_CITIES.length * nicheState.round) {
-          exhausted = true; break;
+          isExh = true;
         }
-        continue;
+      } else {
+        nicheState.offset += results.length;
       }
-      nicheState.offset += results.length;
     } else if (nicheState.coords) {
       // Specific city with geocoded coordinates
       ({ results, rateLimited: rl, exhausted: exh } = await searchTomTomByCoord({
@@ -516,7 +518,7 @@ async function collectForNiche({ niche, city, country, poolTarget, seenDomains, 
         limit: TOMTOM_PAGE_SIZE, offset: nicheState.offset, tomtomCallCounter,
       }));
       if (rl) { rateLimited = true; break; }
-      if (exh || results.length < TOMTOM_PAGE_SIZE) { exhausted = true; break; }
+      if (exh || results.length < TOMTOM_PAGE_SIZE) { isExh = true; }
       nicheState.offset += results.length;
     } else {
       // Country-wide text search
@@ -524,12 +526,12 @@ async function collectForNiche({ niche, city, country, poolTarget, seenDomains, 
         niche, country, city, limit: TOMTOM_PAGE_SIZE, offset: nicheState.offset, tomtomCallCounter,
       }));
       if (rl) { rateLimited = true; break; }
-      if (exh || results.length < TOMTOM_PAGE_SIZE) { exhausted = true; break; }
+      if (exh || results.length < TOMTOM_PAGE_SIZE) { isExh = true; }
       nicheState.offset += results.length;
     }
 
     // Filter and dedupe
-    for (const r of results.map(parseTomTomResult)) {
+    for (const r of (results || []).map(parseTomTomResult)) {
       if (!r.website) continue;
       const domain = getDomain(r.website);
       if (!domain || isDirectoryDomain(domain) || seenDomains.has(domain)) continue;
@@ -539,6 +541,11 @@ async function collectForNiche({ niche, city, country, poolTarget, seenDomains, 
     }
 
     console.log(`[LeadFinder]   ${niche} offset=${nicheState.offset} (page ${pagesThisRound}/${MAX_PAGES_PER_ROUND}) → pool=${candidates.length}/${poolTarget}`);
+
+    if (isExh) {
+      exhausted = true;
+      break;
+    }
   }
 
   return { candidates, rateLimited, exhausted };
@@ -735,17 +742,16 @@ const runMultiNicheSearch = async ({
     }
 
     // ── Phase 2: scrape emails ────────────────────────────────────────────
-    // Stop scraping as soon as this round's needed leads are found
-    const roundNeeded = nicheStates.reduce((s, ns) => s + Math.max(0, ns.target - ns.saved), 0);
+    // Stop scraping as soon as this round's needed leads or totalLeads are found
     let roundValid    = 0;
     let roundScraped  = 0;
-    const roundLeads  = [];   // { biz, niche }
+    const roundLeads  = [];   // { biz, email, niche }
 
     onProgress({ round: roundNum, scraping: true, totalSaved, target: totalLeads, roundCandidates: roundCandidates.length });
 
     for (let bStart = 0; bStart < roundCandidates.length; bStart += SCRAPE_CONCURRENCY) {
       if (isCancelled() || timeLimitHit()) break;
-      if (roundValid >= roundNeeded) break;  // got enough for this round
+      if (totalSaved + roundLeads.length >= totalLeads) break;  // target reached
 
       const bSlice = roundCandidates.slice(bStart, bStart + SCRAPE_CONCURRENCY);
       const jobs   = bSlice.map(biz => async () => {
@@ -760,10 +766,8 @@ const runMultiNicheSearch = async ({
         const norm = r.email.toLowerCase().trim();
         if (seenEmails.has(norm)) continue;
 
-        // Find niche state
-        const ni  = r.biz._nicheIdx ?? 0;
-        const ns  = nicheStates[ni] || nicheStates[0];
-        if (ns.saved >= ns.target) continue;   // this niche is full
+        // Stop immediately if target is reached — ignore further results in flight
+        if (totalSaved + roundLeads.length >= totalLeads) break;
 
         seenEmails.add(norm);
         roundLeads.push({ biz: r.biz, email: norm, niche: r.biz._niche || niches[0] });
@@ -773,8 +777,10 @@ const runMultiNicheSearch = async ({
       onProgress({
         round: roundNum, scraping: true,
         roundScraped, roundCandidates: roundCandidates.length,
-        roundValid, totalSaved, target: totalLeads,
+        roundValid: roundLeads.length, totalSaved, target: totalLeads,
       });
+
+      if (totalSaved + roundLeads.length >= totalLeads) break;
     }
 
     // Track yield per niche for next round sizing
@@ -784,10 +790,14 @@ const runMultiNicheSearch = async ({
       ns.prevYield = { valid: nicheLeads, scraped: nicheCandidates };
     }
 
-    console.log(`[LeadFinder] Round ${roundNum} Phase 2 done: scraped=${roundScraped} valid=${roundValid} | ${elapsed()}s`);
+    console.log(`[LeadFinder] Round ${roundNum} Phase 2 done: scraped=${roundScraped} valid=${roundLeads.length} | ${elapsed()}s`);
 
     // ── Save this round's leads ──────────────────────────────────────────
-    if (roundLeads.length > 0) {
+    // Trim roundLeads so that totalSaved + leadsToSave never exceeds totalLeads
+    const maxToSave   = Math.max(0, totalLeads - totalSaved);
+    const leadsToSave = roundLeads.slice(0, maxToSave);
+
+    if (leadsToSave.length > 0) {
       // Create batch on first save
       if (!batchId) {
         batchName = `${locationLabel} - Multi-Niche (${nicheLabel})`;
@@ -800,7 +810,7 @@ const runMultiNicheSearch = async ({
         console.log(`[LeadFinder] Created batch "${batchName}" (${batchId})`);
       }
 
-      await Lead.insertMany(roundLeads.map(l => ({
+      await Lead.insertMany(leadsToSave.map(l => ({
         batchId,
         company: l.biz.name,
         city:    l.biz.city || city || country,
@@ -811,16 +821,16 @@ const runMultiNicheSearch = async ({
       })));
 
       // Update niche saved counts
-      for (const l of roundLeads) {
+      for (const l of leadsToSave) {
         const ns = nicheStates.find(n => n.niche === l.niche);
         if (ns) ns.saved++;
       }
 
-      totalSaved += roundLeads.length;
+      totalSaved += leadsToSave.length;
 
       // Update batch leadCount
       await Batch.updateOne({ _id: batchId }, { leadCount: totalSaved });
-      console.log(`[LeadFinder] Round ${roundNum}: saved ${roundLeads.length} leads (total=${totalSaved})`);
+      console.log(`[LeadFinder] Round ${roundNum}: saved ${leadsToSave.length} leads (total=${totalSaved})`);
     }
 
     const roundElapsed = Math.round((Date.now() - roundStart) / 1000);
@@ -828,9 +838,9 @@ const runMultiNicheSearch = async ({
       round:      roundNum,
       candidates: roundCandidates.length,
       scraped:    roundScraped,
-      validFound: roundValid,
+      validFound: leadsToSave.length,
       saved:      totalSaved,
-      remaining:  totalLeads - totalSaved,
+      remaining:  Math.max(0, totalLeads - totalSaved),
       elapsedSec: roundElapsed,
     };
     allRoundStats.push(roundStats);
@@ -841,7 +851,7 @@ const runMultiNicheSearch = async ({
     // ── Check stop conditions after round ───────────────────────────────
     if (totalSaved >= totalLeads) { stopReason = 'target_reached'; break; }
     if (rateLimited)              { stopReason = 'rate_limit';     break; }
-    if (roundValid === 0)         { stopReason = 'no_new_leads';   break; }
+    if (leadsToSave.length === 0) { stopReason = 'no_new_leads';   break; }
     if (isCancelled())            { stopReason = 'cancelled';      break; }
     if (timeLimitHit())           { stopReason = 'time_limit';     break; }
 
