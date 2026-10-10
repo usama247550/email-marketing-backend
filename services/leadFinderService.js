@@ -37,7 +37,8 @@ const TOMTOM_POI_URL       = 'https://api.tomtom.com/search/2/poiSearch';
 const TOMTOM_GEO_URL       = 'https://api.tomtom.com/search/2/geocode';
 const TOMTOM_PAGE_SIZE     = 100;
 const TOMTOM_CALL_DELAY_MS = 250;
-const TOMTOM_MAX_CALLS     = 60;
+const getTomTomMaxCalls    = () => parseInt(process.env.TOMTOM_MAX_CALLS_PER_RUN, 10) || 40;
+const MAX_PAGES_SINGLE_CITY = 6;
 const MAX_ROUNDS           = 3;
 const TIME_LIMIT_MS        = 6 * 60 * 1000;   // 6 minutes
 const SCRAPE_CONCURRENCY   = 20;
@@ -461,28 +462,49 @@ function isDirectoryDomain(domain) {
 
 /**
  * Collect up to `poolTarget` new candidates for a single niche.
- * Continues from where the previous round left off (via `nicheState.offset`).
- * Up to MAX_PAGES_PER_ROUND (4 pages = 400 TomTom results) per niche term per round.
+ * Continues from where the previous round left off.
  *
- * For a specific city with coordinates: uses POI search by lat/lon.
- * For all-cities Germany: iterates `nicheState.cityIdx` through GERMANY_CITIES.
- * For other countries: uses the text search with city=''.
+ * For a specific city with coordinates: uses POI search by lat/lon (max 6 pages per round).
+ * For all-cities Germany: round-robin over GERMANY_CITIES (1 page per city per pass, no fixed page cap).
+ * For other countries / text search: uses text search with city='' (max 6 pages per round).
  *
  * @returns { candidates: Biz[], rateLimited: bool, exhausted: bool }
  */
-async function collectForNiche({ niche, city, country, poolTarget, seenDomains, nicheState, tomtomCallCounter, isAllCitiesGermany }) {
+async function collectForNiche({
+  niche,
+  city,
+  country,
+  poolTarget,
+  seenDomains,
+  nicheState,
+  tomtomCallCounter,
+  isAllCitiesGermany,
+  cancelFlag,
+  runStart,
+  citiesCoveredMap,
+}) {
   const candidates = [];
   let rateLimited  = false;
   let exhausted    = false;
   let firstCall    = true;
   let pagesThisRound = 0;
-  const MAX_PAGES_PER_ROUND = 4;
+  const maxPages = isAllCitiesGermany ? Infinity : MAX_PAGES_SINGLE_CITY;
+  const maxCalls = getTomTomMaxCalls();
 
-  while (candidates.length < poolTarget && !rateLimited && pagesThisRound < MAX_PAGES_PER_ROUND) {
+  while (
+    candidates.length < poolTarget &&
+    !rateLimited &&
+    !exhausted &&
+    pagesThisRound < maxPages
+  ) {
+    if (cancelFlag?.cancelled === true) break;
+    if (runStart && (Date.now() - runStart) >= TIME_LIMIT_MS) break;
+
     // Check TomTom call budget
-    if (tomtomCallCounter.count >= TOMTOM_MAX_CALLS) {
-      console.log(`[LeadFinder] TomTom call cap (${TOMTOM_MAX_CALLS}) reached`);
-      rateLimited = true; break;
+    if (tomtomCallCounter.count >= maxCalls) {
+      console.log(`[LeadFinder] TomTom call cap (${maxCalls}) reached`);
+      rateLimited = true;
+      break;
     }
 
     if (!firstCall) await sleep(TOMTOM_CALL_DELAY_MS);
@@ -490,62 +512,136 @@ async function collectForNiche({ niche, city, country, poolTarget, seenDomains, 
     pagesThisRound++;
 
     let results, rl, exh;
-
-    let isExh = false;
+    let cityName = '';
+    let cityPageNum = 1;
 
     if (isAllCitiesGermany) {
-      // Cycle through German cities
-      const cityEntry = GERMANY_CITIES[nicheState.cityIdx % GERMANY_CITIES.length];
+      // Round-robin through German cities
+      let foundCity = null;
+      const numCities = GERMANY_CITIES.length;
+
+      for (let attempt = 0; attempt < numCities; attempt++) {
+        const candidateIdx = (nicheState.cityIdx + attempt) % numCities;
+        const cityEntry = GERMANY_CITIES[candidateIdx];
+        if (!nicheState.exhaustedCities.has(cityEntry.name)) {
+          foundCity = cityEntry;
+          nicheState.cityIdx = (candidateIdx + 1) % numCities;
+          break;
+        }
+      }
+
+      if (!foundCity) {
+        exhausted = true;
+        break;
+      }
+
+      cityName = foundCity.name;
+      const cityOffset = nicheState.cityOffsets[cityName] || 0;
+      cityPageNum = Math.floor(cityOffset / TOMTOM_PAGE_SIZE) + 1;
+
       ({ results, rateLimited: rl, exhausted: exh } = await searchTomTomByCoord({
-        niche, lat: cityEntry.lat, lon: cityEntry.lon, country: 'Germany',
-        limit: TOMTOM_PAGE_SIZE, offset: nicheState.offset, tomtomCallCounter,
+        niche,
+        lat: foundCity.lat,
+        lon: foundCity.lon,
+        country: 'Germany',
+        limit: TOMTOM_PAGE_SIZE,
+        offset: cityOffset,
+        tomtomCallCounter,
       }));
-      if (rl) { rateLimited = true; break; }
-      if (exh || results.length < TOMTOM_PAGE_SIZE) {
-        // Move to next city for this niche
-        nicheState.cityIdx++;
-        nicheState.offset = 0;
-        if (nicheState.cityIdx >= GERMANY_CITIES.length * nicheState.round) {
-          isExh = true;
+
+      if (rl) {
+        rateLimited = true;
+        break;
+      }
+
+      if (exh || !results || results.length < TOMTOM_PAGE_SIZE) {
+        nicheState.exhaustedCities.add(cityName);
+        if (nicheState.exhaustedCities.size >= numCities) {
+          exhausted = true;
         }
       } else {
-        nicheState.offset += results.length;
+        nicheState.cityOffsets[cityName] = cityOffset + results.length;
       }
     } else if (nicheState.coords) {
       // Specific city with geocoded coordinates
+      cityName = city || 'Target City';
+      cityPageNum = Math.floor(nicheState.offset / TOMTOM_PAGE_SIZE) + 1;
+
       ({ results, rateLimited: rl, exhausted: exh } = await searchTomTomByCoord({
-        niche, lat: nicheState.coords.lat, lon: nicheState.coords.lon, country,
-        limit: TOMTOM_PAGE_SIZE, offset: nicheState.offset, tomtomCallCounter,
+        niche,
+        lat: nicheState.coords.lat,
+        lon: nicheState.coords.lon,
+        country,
+        limit: TOMTOM_PAGE_SIZE,
+        offset: nicheState.offset,
+        tomtomCallCounter,
       }));
-      if (rl) { rateLimited = true; break; }
-      if (exh || results.length < TOMTOM_PAGE_SIZE) { isExh = true; }
-      nicheState.offset += results.length;
+
+      if (rl) {
+        rateLimited = true;
+        break;
+      }
+      if (exh || !results || results.length < TOMTOM_PAGE_SIZE) {
+        exhausted = true;
+      }
+      nicheState.offset += (results?.length || 0);
     } else {
       // Country-wide text search
+      cityName = city || country || 'All';
+      cityPageNum = Math.floor(nicheState.offset / TOMTOM_PAGE_SIZE) + 1;
+
       ({ results, rateLimited: rl, exhausted: exh } = await searchTomTom({
-        niche, country, city, limit: TOMTOM_PAGE_SIZE, offset: nicheState.offset, tomtomCallCounter,
+        niche,
+        country,
+        city,
+        limit: TOMTOM_PAGE_SIZE,
+        offset: nicheState.offset,
+        tomtomCallCounter,
       }));
-      if (rl) { rateLimited = true; break; }
-      if (exh || results.length < TOMTOM_PAGE_SIZE) { isExh = true; }
-      nicheState.offset += results.length;
+
+      if (rl) {
+        rateLimited = true;
+        break;
+      }
+      if (exh || !results || results.length < TOMTOM_PAGE_SIZE) {
+        exhausted = true;
+      }
+      nicheState.offset += (results?.length || 0);
     }
 
     // Filter and dedupe
+    let withWebsite = 0, skippedNoWebsite = 0, skippedDir = 0, skippedDup = 0, kept = 0;
     for (const r of (results || []).map(parseTomTomResult)) {
-      if (!r.website) continue;
+      if (!r.website) {
+        skippedNoWebsite++;
+        continue;
+      }
+      withWebsite++;
       const domain = getDomain(r.website);
-      if (!domain || isDirectoryDomain(domain) || seenDomains.has(domain)) continue;
+      if (!domain || isDirectoryDomain(domain)) {
+        skippedDir++;
+        continue;
+      }
+      if (seenDomains.has(domain)) {
+        skippedDup++;
+        continue;
+      }
       seenDomains.add(domain);
+      if (isAllCitiesGermany && !r.city && cityName) {
+        r.city = cityName;
+      }
       candidates.push(r);
+      kept++;
+
+      if (citiesCoveredMap) {
+        const cName = r.city || cityName || city || country;
+        citiesCoveredMap.set(cName, (citiesCoveredMap.get(cName) || 0) + 1);
+      }
+
       if (candidates.length >= poolTarget) break;
     }
 
-    console.log(`[LeadFinder]   ${niche} offset=${nicheState.offset} (page ${pagesThisRound}/${MAX_PAGES_PER_ROUND}) → pool=${candidates.length}/${poolTarget}`);
-
-    if (isExh) {
-      exhausted = true;
-      break;
-    }
+    console.log(`[LeadFinder] [${cityName}] [${niche}] page ${cityPageNum} | results=${results?.length || 0} | withWebsite=${withWebsite} | noWebsite=${skippedNoWebsite} | dirSkip=${skippedDir} | dupSkip=${skippedDup} | kept=${kept} (nichePool=${candidates.length}/${poolTarget})`);
   }
 
   return { candidates, rateLimited, exhausted };
@@ -646,16 +742,19 @@ const runMultiNicheSearch = async ({
   const quotas     = distribute(totalLeads, niches.length);  // initial per-niche targets
   const nicheStates = niches.map((niche, i) => ({
     niche,
-    target:    quotas[i],    // valid leads needed from this niche
-    saved:     0,            // valid leads saved so far from this niche
-    offset:    0,            // TomTom pagination offset
-    cityIdx:   0,            // Germany all-cities city index
-    round:     1,            // current round number (for city cycling limit)
-    coords:    cityCoords,   // geocoded lat/lon for specific city (or null)
-    exhausted: false,        // true = no more TomTom results
-    prevYield: null,         // { valid, scraped } from last round for pool sizing
+    target:          quotas[i],    // valid leads needed from this niche
+    saved:           0,            // valid leads saved so far from this niche
+    offset:          0,            // TomTom pagination offset (for single city/country text search)
+    cityIdx:         0,            // Germany all-cities round-robin index
+    cityOffsets:     {},           // per-city offset map for Germany all-cities: { [cityName]: number }
+    exhaustedCities: new Set(),    // per-niche set of exhausted German cities
+    round:           1,            // current round number
+    coords:          cityCoords,   // geocoded lat/lon for specific city (or null)
+    exhausted:       false,        // true = no more TomTom results
+    prevYield:       null,         // { valid, scraped } from last round for pool sizing
   }));
 
+  const citiesCoveredMap = new Map();
   let batchId    = null;
   let batchName  = null;
   let totalSaved = 0;
@@ -667,7 +766,7 @@ const runMultiNicheSearch = async ({
   for (let roundNum = 1; roundNum <= MAX_ROUNDS; roundNum++) {
     if (isCancelled())  { stopReason = 'cancelled';   break; }
     if (timeLimitHit()) { stopReason = 'time_limit';  break; }
-    if (tomtomCallCounter.count >= TOMTOM_MAX_CALLS) { stopReason = 'rate_limit'; break; }
+    if (tomtomCallCounter.count >= getTomTomMaxCalls()) { stopReason = 'rate_limit'; break; }
 
     const activeNiches = nicheStates.filter(ns => !ns.exhausted && ns.target > ns.saved);
     if (activeNiches.length === 0) { stopReason = 'all_niches_exhausted'; break; }
@@ -700,8 +799,8 @@ const runMultiNicheSearch = async ({
     for (let ni = 0; ni < activeNiches.length; ni++) {
       const ns    = activeNiches[ni];
       const pSize = poolPerNiche[ni];
-      if (isCancelled() || timeLimitHit() || tomtomCallCounter.count >= TOMTOM_MAX_CALLS) {
-        rateLimited = tomtomCallCounter.count >= TOMTOM_MAX_CALLS;
+      if (isCancelled() || timeLimitHit() || tomtomCallCounter.count >= getTomTomMaxCalls()) {
+        rateLimited = tomtomCallCounter.count >= getTomTomMaxCalls();
         break;
       }
 
@@ -715,6 +814,9 @@ const runMultiNicheSearch = async ({
         nicheState:          ns,
         tomtomCallCounter,
         isAllCitiesGermany,
+        cancelFlag,
+        runStart,
+        citiesCoveredMap,
       });
 
       if (exhausted) {
@@ -727,7 +829,7 @@ const runMultiNicheSearch = async ({
       for (const c of candidates) { c._niche = ns.niche; c._nicheIdx = ni; }
       roundCandidates.push(...candidates);
 
-      console.log(`[LeadFinder]   Collected ${candidates.length} candidates for "${ns.niche}" (offset=${ns.offset})`);
+      console.log(`[LeadFinder]   Collected ${candidates.length} candidates for "${ns.niche}"`);
       onProgress({ round: roundNum, collecting: true, niche: ns.niche, totalSaved, target: totalLeads });
     }
 
@@ -738,7 +840,12 @@ const runMultiNicheSearch = async ({
     console.log(`[LeadFinder] Round ${roundNum} Phase 1 done: ${roundCandidates.length} candidates | ${elapsed()}s`);
 
     if (roundCandidates.length === 0) {
-      stopReason = 'no_candidates'; break;
+      if (activeNiches.every(ns => ns.exhausted)) {
+        stopReason = 'no_candidates';
+      } else if (tomtomCallCounter.count >= getTomTomMaxCalls()) {
+        stopReason = 'rate_limit';
+      }
+      break;
     }
 
     // ── Phase 2: scrape emails ────────────────────────────────────────────
@@ -861,15 +968,21 @@ const runMultiNicheSearch = async ({
 
   if (!stopReason) stopReason = MAX_ROUNDS + '_rounds_done';
 
+  const citiesCovered = Array.from(citiesCoveredMap.entries()).map(([cityName, count]) => ({
+    city: cityName,
+    count,
+  }));
+
   const totalElapsed = elapsed();
   const summary = {
     batchId,
     batchName,
-    totalFound:    totalSaved,
-    validCount:    totalSaved,
-    checkedCount:  allRoundStats.reduce((s, r) => s + r.scraped, 0),
+    totalFound:      totalSaved,
+    validCount:      totalSaved,
+    checkedCount:    allRoundStats.reduce((s, r) => s + r.scraped, 0),
     tomtomCallCount: tomtomCallCounter.count,
-    rounds:        allRoundStats,
+    citiesCovered,
+    rounds:          allRoundStats,
     stopReason,
     totalElapsedSec: totalElapsed,
     fetchErrorCounts,
@@ -889,6 +1002,9 @@ const runMultiNicheSearch = async ({
 
 module.exports = {
   runMultiNicheSearch,
+  collectForNiche,
+  GERMANY_CITIES,
+  getTomTomMaxCalls,
   // ── Shared helpers used by smartSearchService ───────────────────────────
   searchTomTom,
   parseTomTomResult,
