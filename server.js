@@ -36,7 +36,14 @@ connectDB();
 // Using the 'connected' event works whether connectDB() resolved before or
 // after this line executes (Mongoose buffers and replays the event).
 const mongoose = require('mongoose');
-mongoose.connection.once('connected', () => {
+mongoose.connection.once('connected', async () => {
+  try {
+    const Automation = require('./models/Automation');
+    await Automation.updateMany({}, { $set: { isRunning: false } });
+    console.log('🔄 All automation isRunning flags reset to false.');
+  } catch (err) {
+    console.error('Error resetting automation isRunning flags:', err.message);
+  }
   startScheduler();
 });
 

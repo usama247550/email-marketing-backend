@@ -23,12 +23,20 @@ const { runAutomation }                = require('./automationEngine');
 const runningAutomations = new Set();
 
 const startScheduler = () => {
+  if (process.env.ENABLE_SCHEDULER === 'false') {
+    console.log('[Scheduler] ──────────────────────────────────────────────');
+    console.log('[Scheduler] ENABLE_SCHEDULER is set to "false".');
+    console.log('[Scheduler] Automation scheduler is OFF.');
+    console.log('[Scheduler] ──────────────────────────────────────────────');
+    return;
+  }
+
   const TZ = process.env.SCHEDULER_TIMEZONE || 'Asia/Karachi';
 
   // ── Startup diagnostic log ──────────────────────────────────────────────
   const startupNow = new Date();
   console.log('[Scheduler] ──────────────────────────────────────────────');
-  console.log('[Scheduler] Automation scheduler starting.');
+  console.log('[Scheduler] Automation scheduler starting (ON).');
   console.log(`[Scheduler] Configured timezone : ${TZ}`);
   console.log(`[Scheduler] Server UTC time     : ${startupNow.toISOString()}`);
   console.log(`[Scheduler] Server local time   : ${startupNow.toString()}`);

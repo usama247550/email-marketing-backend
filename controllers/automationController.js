@@ -38,11 +38,51 @@ exports.getAutomationById = async (req, res) => {
   }
 };
 
+// Helper to validate and clean finder settings
+function validateFinder(finder) {
+  if (!finder || typeof finder !== 'object') {
+    return { error: 'finder object is required when leadSource is "finder"' };
+  }
+  const country = typeof finder.country === 'string' ? finder.country.trim() : '';
+  if (!country) {
+    return { error: 'finder.country is required when leadSource is "finder"' };
+  }
+  if (!Array.isArray(finder.niches) || finder.niches.length === 0) {
+    return { error: 'finder.niches must contain 1 to 10 non-empty strings' };
+  }
+  const cleanedNiches = finder.niches
+    .map(n => (typeof n === 'string' ? n.trim() : ''))
+    .filter(Boolean);
+  if (cleanedNiches.length === 0 || cleanedNiches.length > 10) {
+    return { error: 'finder.niches must contain 1 to 10 non-empty strings' };
+  }
+  const allCities = Boolean(finder.allCities);
+  const city = typeof finder.city === 'string' ? finder.city.trim() : '';
+  if (!allCities && !city) {
+    return { error: 'finder.city is required unless allCities is true' };
+  }
+  const rawLeads = Number(finder.leadsPerDay);
+  const leadsPerDay = Math.max(5, Math.min(100, isNaN(rawLeads) || rawLeads < 1 ? 50 : Math.round(rawLeads)));
+
+  return {
+    value: {
+      country,
+      city: allCities ? '' : city,
+      allCities,
+      niches: cleanedNiches,
+      leadsPerDay,
+    },
+  };
+}
+
 // ─── POST /api/automations ────────────────────────────────────────────────────
 
 exports.createAutomation = async (req, res) => {
   try {
-    const { name, projectId, templateId, dailyLimit, scheduledTime, status } = req.body;
+    const {
+      name, projectId, templateId, dailyLimit, scheduledTime, status,
+      leadSource, finder
+    } = req.body;
 
     if (!name || !projectId || !templateId || !scheduledTime) {
       return res.status(400).json({
@@ -59,6 +99,23 @@ exports.createAutomation = async (req, res) => {
       });
     }
 
+    const effectiveLeadSource = leadSource === 'finder' ? 'finder' : 'existing';
+    let effectiveFinder = undefined;
+
+    if (effectiveLeadSource === 'finder') {
+      const validated = validateFinder(finder);
+      if (validated.error) {
+        return res.status(400).json({
+          success: false,
+          message: validated.error,
+        });
+      }
+      effectiveFinder = validated.value;
+    } else if (finder && typeof finder === 'object') {
+      // Optional: keep incoming finder settings even if leadSource is existing
+      effectiveFinder = finder;
+    }
+
     const automation = new Automation({
       name: name.trim(),
       projectId,
@@ -66,6 +123,8 @@ exports.createAutomation = async (req, res) => {
       dailyLimit: dailyLimit ?? 50,
       scheduledTime,
       status: status || 'active',
+      leadSource: effectiveLeadSource,
+      ...(effectiveFinder ? { finder: effectiveFinder } : {}),
     });
 
     await automation.save();
@@ -91,7 +150,27 @@ exports.updateAutomation = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Automation not found' });
     }
 
-    const allowed = ['name', 'projectId', 'templateId', 'dailyLimit', 'scheduledTime', 'status'];
+    const allowed = [
+      'name', 'projectId', 'templateId', 'dailyLimit', 'scheduledTime', 'status',
+      'leadSource', 'finder',
+    ];
+
+    const targetLeadSource = req.body.leadSource !== undefined ? req.body.leadSource : automation.leadSource;
+
+    if (targetLeadSource === 'finder') {
+      const candidateFinder = req.body.finder !== undefined ? req.body.finder : automation.finder;
+      const validated = validateFinder(candidateFinder);
+      if (validated.error) {
+        return res.status(400).json({
+          success: false,
+          message: validated.error,
+        });
+      }
+      if (req.body.finder !== undefined) {
+        req.body.finder = validated.value;
+      }
+    }
+
     for (const field of allowed) {
       if (req.body[field] !== undefined) {
         automation[field] = req.body[field];

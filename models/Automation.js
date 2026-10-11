@@ -39,6 +39,44 @@ const automationSchema = new mongoose.Schema({
     type: Number,
     default: 0,
   },
+  // Lead Finder integration
+  leadSource: {
+    type: String,
+    enum: ['existing', 'finder'],
+    default: 'existing',
+  },
+  finder: {
+    country:     { type: String, default: null },
+    city:        { type: String, default: null },
+    allCities:   { type: Boolean, default: false },
+    niches:      { type: [String], default: [] },
+    leadsPerDay: { type: Number, default: 50 },
+  },
+  finderCursor: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null,
+  },
+  lastRunFoundCount: {
+    type: Number,
+    default: 0,
+  },
+  lastRunFinderStatus: {
+    type: String,
+    enum: ['ok', 'failed', 'skipped', null],
+    default: null,
+  },
+  lastRunFinderMessage: {
+    type: String,
+    default: null,
+  },
+  isRunning: {
+    type: Boolean,
+    default: false,
+  },
+  runStartedAt: {
+    type: Date,
+    default: null,
+  },
   // Set when the automation is auto-paused because its linked Project or
   // Template was deleted.  Cleared when the user updates the automation with
   // a valid replacement.

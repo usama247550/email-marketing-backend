@@ -669,6 +669,23 @@ function redistributeExhaustedQuotas(nicheStates) {
   }
 }
 
+// ── In-memory search lock ───────────────────────────────────────────────────
+let isFinderActive = false;
+
+function isLeadFinderActive() {
+  return isFinderActive;
+}
+
+function acquireLeadFinderLock() {
+  if (isFinderActive) return false;
+  isFinderActive = true;
+  return true;
+}
+
+function releaseLeadFinderLock() {
+  isFinderActive = false;
+}
+
 // ── Main: runMultiNicheSearch ─────────────────────────────────────────────────
 
 /**
@@ -684,6 +701,8 @@ function redistributeExhaustedQuotas(nicheStates) {
  * @param {object}   opts.cancelFlag     { cancelled: boolean }
  * @param {Function} opts.onBatchCreated (batchId) => void   — called the first time the batch is created
  * @param {Function} opts.onRoundDone    (roundStats) => void
+ * @param {object}   opts.cursor         optional saved cursor from previous run
+ * @param {string}   opts.batchNamePrefix optional prefix for batch name (e.g. "Auto")
  */
 const runMultiNicheSearch = async ({
   projectId, country, city, niches, totalLeads,
@@ -691,68 +710,93 @@ const runMultiNicheSearch = async ({
   cancelFlag,
   onBatchCreated,
   onRoundDone,
+  cursor,
+  batchNamePrefix,
 }) => {
-  const onProgress   = typeof rawProgress    === 'function' ? rawProgress    : () => {};
-  const isCancelled  = () => cancelFlag?.cancelled === true;
-  const notifyBatch  = typeof onBatchCreated === 'function' ? onBatchCreated : () => {};
-  const notifyRound  = typeof onRoundDone    === 'function' ? onRoundDone    : () => {};
-
-  const runStart = Date.now();
-  const elapsed  = () => Math.round((Date.now() - runStart) / 1000);
-  const timeLimitHit = () => (Date.now() - runStart) >= TIME_LIMIT_MS;
-
-  const isAllCitiesGermany = !city && country.toLowerCase().includes('germany');
-  const locationLabel      = city || (isAllCitiesGermany ? 'All cities' : country);
-  const nicheLabel         = niches.join(', ');
-
-  console.log(`[LeadFinder] ── Starting multi-round pipeline ──────────────────────`);
-  console.log(`[LeadFinder] project:${projectId} | location:${locationLabel} | niches:[${nicheLabel}] | target:${totalLeads}`);
-
-  // ── Pre-load project domains and emails ────────────────────────────────────
-  const existingBatches  = await Batch.find({ projectId }, '_id');
-  const existingBatchIds = existingBatches.map(b => b._id);
-  const seenDomains      = new Set();
-  const seenEmails       = new Set();
-
-  if (existingBatchIds.length > 0) {
-    const existing = await Lead.find(
-      { batchId: { $in: existingBatchIds }, email: { $exists: true, $ne: '' } },
-      'email website',
-    ).lean();
-    for (const l of existing) {
-      if (l.email)   seenEmails.add(l.email.toLowerCase().trim());
-      if (l.website) { const d = getDomain(l.website); if (d) seenDomains.add(d); }
-    }
-    console.log(`[LeadFinder] Pre-loaded ${seenDomains.size} domains, ${seenEmails.size} emails for dedup`);
+  if (!acquireLeadFinderLock()) {
+    const err = new Error('Another lead finder run was in progress');
+    err.code = 'FINDER_BUSY';
+    throw err;
   }
 
-  // ── Geocode city (once, before rounds) ────────────────────────────────────
-  const tomtomCallCounter = { count: 0 };
-  let cityCoords = null;
-  if (city && city.trim()) {
-    cityCoords = await geocodeCity(city, country, tomtomCallCounter);
-    if (cityCoords) {
-      console.log(`[LeadFinder] Geocoded "${city}": lat=${cityCoords.lat} lon=${cityCoords.lon}`);
-    } else {
-      console.warn(`[LeadFinder] Geocode failed for "${city}" — falling back to text search`);
-    }
-  }
+  try {
+    const onProgress   = typeof rawProgress    === 'function' ? rawProgress    : () => {};
+    const isCancelled  = () => cancelFlag?.cancelled === true;
+    const notifyBatch  = typeof onBatchCreated === 'function' ? onBatchCreated : () => {};
+    const notifyRound  = typeof onRoundDone    === 'function' ? onRoundDone    : () => {};
 
-  // ── Per-niche state (persists across rounds) ───────────────────────────────
-  const quotas     = distribute(totalLeads, niches.length);  // initial per-niche targets
-  const nicheStates = niches.map((niche, i) => ({
-    niche,
-    target:          quotas[i],    // valid leads needed from this niche
-    saved:           0,            // valid leads saved so far from this niche
-    offset:          0,            // TomTom pagination offset (for single city/country text search)
-    cityIdx:         0,            // Germany all-cities round-robin index
-    cityOffsets:     {},           // per-city offset map for Germany all-cities: { [cityName]: number }
-    exhaustedCities: new Set(),    // per-niche set of exhausted German cities
-    round:           1,            // current round number
-    coords:          cityCoords,   // geocoded lat/lon for specific city (or null)
-    exhausted:       false,        // true = no more TomTom results
-    prevYield:       null,         // { valid, scraped } from last round for pool sizing
-  }));
+    const runStart = Date.now();
+    const elapsed  = () => Math.round((Date.now() - runStart) / 1000);
+    const timeLimitHit = () => (Date.now() - runStart) >= TIME_LIMIT_MS;
+
+    const isAllCitiesGermany = !city && country.toLowerCase().includes('germany');
+    const locationLabel      = city || (isAllCitiesGermany ? 'All cities' : country);
+    const nicheLabel         = niches.join(', ');
+
+    console.log(`[LeadFinder] ── Starting multi-round pipeline ──────────────────────`);
+    console.log(`[LeadFinder] project:${projectId} | location:${locationLabel} | niches:[${nicheLabel}] | target:${totalLeads}`);
+
+    // ── Pre-load project domains and emails ────────────────────────────────────
+    const existingBatches  = await Batch.find({ projectId }, '_id');
+    const existingBatchIds = existingBatches.map(b => b._id);
+    const seenDomains      = new Set();
+    const seenEmails       = new Set();
+
+    if (existingBatchIds.length > 0) {
+      const existing = await Lead.find(
+        { batchId: { $in: existingBatchIds }, email: { $exists: true, $ne: '' } },
+        'email website',
+      ).lean();
+      for (const l of existing) {
+        if (l.email)   seenEmails.add(l.email.toLowerCase().trim());
+        if (l.website) { const d = getDomain(l.website); if (d) seenDomains.add(d); }
+      }
+      console.log(`[LeadFinder] Pre-loaded ${seenDomains.size} domains, ${seenEmails.size} emails for dedup`);
+    }
+
+    // ── Geocode city (once, before rounds) ────────────────────────────────────
+    const tomtomCallCounter = { count: 0 };
+    let cityCoords = null;
+    if (city && city.trim()) {
+      cityCoords = await geocodeCity(city, country, tomtomCallCounter);
+      if (cityCoords) {
+        console.log(`[LeadFinder] Geocoded "${city}": lat=${cityCoords.lat} lon=${cityCoords.lon}`);
+      } else {
+        console.warn(`[LeadFinder] Geocode failed for "${city}" — falling back to text search`);
+      }
+    }
+
+    // ── Per-niche state (persists across rounds, resumed from cursor if present)
+    const quotas     = distribute(totalLeads, niches.length);  // initial per-niche targets
+    const nicheStates = niches.map((niche, i) => {
+      const savedCursor = (cursor && cursor[niche]) ? cursor[niche] : null;
+      const initialExhaustedCities = savedCursor && Array.isArray(savedCursor.exhaustedCities)
+        ? new Set(savedCursor.exhaustedCities)
+        : new Set();
+      const initialCityOffsets = (savedCursor && savedCursor.cityOffsets && typeof savedCursor.cityOffsets === 'object')
+        ? { ...savedCursor.cityOffsets }
+        : {};
+      const initialOffset = (savedCursor && typeof savedCursor.offset === 'number')
+        ? savedCursor.offset
+        : 0;
+      const initialCityIdx = (savedCursor && typeof savedCursor.cityIdx === 'number')
+        ? savedCursor.cityIdx
+        : 0;
+
+      return {
+        niche,
+        target:          quotas[i],    // valid leads needed from this niche
+        saved:           0,            // valid leads saved so far from this niche
+        offset:          initialOffset, // TomTom pagination offset (for single city/country text search)
+        cityIdx:         initialCityIdx, // Germany all-cities round-robin index
+        cityOffsets:     initialCityOffsets, // per-city offset map for Germany all-cities: { [cityName]: number }
+        exhaustedCities: initialExhaustedCities, // per-niche set of exhausted German cities
+        round:           1,            // current round number
+        coords:          cityCoords,   // geocoded lat/lon for specific city (or null)
+        exhausted:       Boolean(savedCursor?.exhausted), // true = no more TomTom results
+        prevYield:       null,         // { valid, scraped } from last round for pool sizing
+      };
+    });
 
   const citiesCoveredMap = new Map();
   let batchId    = null;
@@ -907,7 +951,12 @@ const runMultiNicheSearch = async ({
     if (leadsToSave.length > 0) {
       // Create batch on first save
       if (!batchId) {
-        batchName = `${locationLabel} - Multi-Niche (${nicheLabel})`;
+        if (batchNamePrefix) {
+          const dateStr = new Date().toISOString().slice(0, 10);
+          batchName = `${batchNamePrefix} - ${locationLabel} - Multi-Niche (${nicheLabel}) - ${dateStr}`;
+        } else {
+          batchName = `${locationLabel} - Multi-Niche (${nicheLabel})`;
+        }
         const batch = new Batch({
           name: batchName, projectId, source: 'Lead Finder Agent', leadCount: 0,
         });
@@ -973,6 +1022,18 @@ const runMultiNicheSearch = async ({
     count,
   }));
 
+  const endCursor = {};
+  for (const ns of nicheStates) {
+    endCursor[ns.niche] = {
+      offset:          ns.offset || 0,
+      cityIdx:         ns.cityIdx || 0,
+      cityOffsets:     { ...(ns.cityOffsets || {}) },
+      exhaustedCities: Array.from(ns.exhaustedCities || []),
+      exhausted:       Boolean(ns.exhausted),
+    };
+  }
+  const allNichesExhausted = nicheStates.every(ns => ns.exhausted);
+
   const totalElapsed = elapsed();
   const summary = {
     batchId,
@@ -986,6 +1047,8 @@ const runMultiNicheSearch = async ({
     stopReason,
     totalElapsedSec: totalElapsed,
     fetchErrorCounts,
+    endCursor,
+    allNichesExhausted,
     perNicheBreakdown: nicheStates.map(ns => ({
       niche:        ns.niche,
       validFound:   ns.saved,
@@ -998,10 +1061,16 @@ const runMultiNicheSearch = async ({
   console.log(`[LeadFinder] stopReason=${stopReason} | saved=${totalSaved}/${totalLeads} | rounds=${allRoundStats.length} | TomTom=${tomtomCallCounter.count}`);
 
   return summary;
+  } finally {
+    releaseLeadFinderLock();
+  }
 };
 
 module.exports = {
   runMultiNicheSearch,
+  isLeadFinderActive,
+  acquireLeadFinderLock,
+  releaseLeadFinderLock,
   collectForNiche,
   GERMANY_CITIES,
   getTomTomMaxCalls,

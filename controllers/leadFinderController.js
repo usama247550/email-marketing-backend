@@ -18,7 +18,7 @@
 'use strict';
 
 const { randomUUID }          = require('crypto');
-const { runMultiNicheSearch } = require('../services/leadFinderService');
+const { runMultiNicheSearch, isLeadFinderActive } = require('../services/leadFinderService');
 const { runSmartSearch }      = require('../services/smartSearchService');
 const Batch                   = require('../models/Batch');
 const Lead                    = require('../models/Lead');
@@ -104,6 +104,12 @@ const triggerMultiNicheSearch = async (req, res) => {
     errors.push('totalLeads must be an integer between 1 and 5000.');
 
   if (errors.length > 0) return res.status(400).json({ error: 'Validation failed', details: errors });
+
+  if (isLeadFinderActive()) {
+    return res.status(409).json({
+      error: 'Another lead finder search is currently in progress.',
+    });
+  }
 
   // Duplicate-run guard
   const runKey = `multi|${projectId}|${[...niches].sort().join(',')}|${city}`;
