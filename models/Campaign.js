@@ -50,4 +50,7 @@ const campaignSchema = new mongoose.Schema({
   }
 });
 
+campaignSchema.index({ sentAt: -1, createdAt: -1 });
+campaignSchema.index({ projectId: 1, sentAt: -1, createdAt: -1 });
+
 module.exports = mongoose.model('Campaign', campaignSchema);

@@ -53,4 +53,6 @@ const emailLogSchema = new mongoose.Schema({
   }
 });
 
+emailLogSchema.index({ sentAt: 1 });
+
 module.exports = mongoose.model('EmailLog', emailLogSchema);
