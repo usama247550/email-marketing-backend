@@ -149,11 +149,13 @@ const deleteTemplate = async (req, res) => {
 
     // Cascade: pause any automations that referenced this template.
     // We pause (not delete) so configs are recoverable.
+    const pauseMsg = `Template "${template.name}" was deleted`;
     const affected = await Automation.updateMany(
       { templateId: req.params.id },
       {
         status: 'paused',
-        orphanReason: `Template "${template.name}" was deleted`,
+        orphanReason: pauseMsg,
+        lastRunFinderMessage: pauseMsg,
       }
     );
     if (affected.modifiedCount > 0) {

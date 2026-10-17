@@ -64,13 +64,31 @@ const runAutomation = async (automationId) => {
     // ── 2. Load Project and Template relations ────────────────────────────
     const project = await Project.findById(automation.projectId).populate('emailApiAccountId');
     if (!project) {
-      console.error(`[AutomationEngine] Project ${automation.projectId} not found for automation "${automation.name}".`);
+      const msg = 'Project was deleted — automation paused automatically';
+      console.warn(`[AutomationEngine] Automation "${automation.name}" (${automationId}): ${msg}`);
+      await Automation.findByIdAndUpdate(automationId, {
+        $set: {
+          status: 'paused',
+          isRunning: false,
+          lastRunFinderMessage: msg,
+          orphanReason: msg,
+        },
+      });
       return { sentCount: 0, skipped: true };
     }
 
     const template = await Template.findById(automation.templateId);
     if (!template) {
-      console.error(`[AutomationEngine] Template ${automation.templateId} not found for automation "${automation.name}".`);
+      const msg = 'Template was deleted — automation paused automatically';
+      console.warn(`[AutomationEngine] Automation "${automation.name}" (${automationId}): ${msg}`);
+      await Automation.findByIdAndUpdate(automationId, {
+        $set: {
+          status: 'paused',
+          isRunning: false,
+          lastRunFinderMessage: msg,
+          orphanReason: msg,
+        },
+      });
       return { sentCount: 0, skipped: true };
     }
 

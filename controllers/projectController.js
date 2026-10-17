@@ -149,11 +149,13 @@ const deleteProject = async (req, res) => {
 
     // Cascade: pause any automations that referenced this project.
     // We pause (not delete) so configs are recoverable.
+    const pauseMsg = `Project "${project.name}" was deleted`;
     const affected = await Automation.updateMany(
       { projectId: req.params.id },
       {
         status: 'paused',
-        orphanReason: `Project "${project.name}" was deleted`,
+        orphanReason: pauseMsg,
+        lastRunFinderMessage: pauseMsg,
       }
     );
     if (affected.modifiedCount > 0) {
