@@ -18,9 +18,14 @@ const cron                             = require('node-cron');
 const { formatInTimeZone, toZonedTime } = require('date-fns-tz');
 const Automation                       = require('../models/Automation');
 const { runAutomation }                = require('./automationEngine');
+const { pollBrevoOpens }               = require('./brevoEventsPoller');
 
 // Prevent overlapping runs of the same automation if a send takes > 1 min
 const runningAutomations = new Set();
+
+// Prevent overlapping Brevo events poller runs
+let isPollerRunning = false;
+let lastWidePassTime = null;
 
 const startScheduler = () => {
   if (process.env.ENABLE_SCHEDULER === 'false') {
@@ -78,46 +83,71 @@ const startScheduler = () => {
 
     if (activeAutomations.length === 0) {
       console.log(`[Scheduler] ${nowTime} ${TZ} | no active automations.`);
-      return;
+    } else {
+      // ── Per-tick summary — shows every active automation and whether it matches
+      const summary = activeAutomations
+        .map(a => `"${a.name}" @ ${a.scheduledTime}${a.scheduledTime === nowTime ? ' ← MATCH' : ''}`)
+        .join(' | ');
+      console.log(`[Scheduler] ${nowTime} ${TZ} | UTC: ${nowUTC.toISOString()} | ${summary}`);
+
+      // ── Find automations that match now and haven't run today ───────────────
+      const candidates = activeAutomations.filter(a => {
+        if (a.scheduledTime !== nowTime) return false;
+        if (!a.lastRunAt) return true;                        // never run
+        return new Date(a.lastRunAt) < startOfTodayUTC;      // ran before today (TZ-aware)
+      });
+
+      if (candidates.length > 0) {
+        console.log(
+          `[Scheduler] → Firing ${candidates.length} automation(s): ` +
+          candidates.map(a => `"${a.name}"`).join(', ')
+        );
+
+        for (const automation of candidates) {
+          const id = automation._id.toString();
+
+          if (runningAutomations.has(id)) {
+            console.warn(`[Scheduler] "${automation.name}" already running — skipping overlap.`);
+            continue;
+          }
+
+          runningAutomations.add(id);
+
+          runAutomation(id)
+            .catch(err => {
+              console.error(`[Scheduler] Error in "${automation.name}":`, err.message);
+            })
+            .finally(() => {
+              runningAutomations.delete(id);
+            });
+        }
+      }
     }
 
-    // ── Per-tick summary — shows every active automation and whether it matches
-    const summary = activeAutomations
-      .map(a => `"${a.name}" @ ${a.scheduledTime}${a.scheduledTime === nowTime ? ' ← MATCH' : ''}`)
-      .join(' | ');
-    console.log(`[Scheduler] ${nowTime} ${TZ} | UTC: ${nowUTC.toISOString()} | ${summary}`);
+    // ── Brevo events poller (every 5 minutes) ────────────────────────────────
+    // Run the poller every 5 minutes (at :00, :05, :10, etc.)
+    // Every hour (at :00 minute mark), do a wide pass (7 days back)
+    const minute = nowUTC.getMinutes();
+    if (minute % 5 === 0) {
+      if (isPollerRunning) {
+        console.log('[Scheduler] Brevo poller already running — skipping this cycle.');
+      } else {
+        isPollerRunning = true;
 
-    // ── Find automations that match now and haven't run today ───────────────
-    const candidates = activeAutomations.filter(a => {
-      if (a.scheduledTime !== nowTime) return false;
-      if (!a.lastRunAt) return true;                        // never run
-      return new Date(a.lastRunAt) < startOfTodayUTC;      // ran before today (TZ-aware)
-    });
+        const isHourlyWidePass = (minute % 60 === 0);
+        const passType = isHourlyWidePass ? 'wide' : 'normal';
 
-    if (candidates.length === 0) return;
-
-    console.log(
-      `[Scheduler] → Firing ${candidates.length} automation(s): ` +
-      candidates.map(a => `"${a.name}"`).join(', ')
-    );
-
-    for (const automation of candidates) {
-      const id = automation._id.toString();
-
-      if (runningAutomations.has(id)) {
-        console.warn(`[Scheduler] "${automation.name}" already running — skipping overlap.`);
-        continue;
+        pollBrevoOpens({ isWidePass: isHourlyWidePass })
+          .catch(err => {
+            console.error(`[Scheduler] Brevo poller error:`, err.message);
+          })
+          .finally(() => {
+            isPollerRunning = false;
+            if (isHourlyWidePass) {
+              lastWidePassTime = nowUTC;
+            }
+          });
       }
-
-      runningAutomations.add(id);
-
-      runAutomation(id)
-        .catch(err => {
-          console.error(`[Scheduler] Error in "${automation.name}":`, err.message);
-        })
-        .finally(() => {
-          runningAutomations.delete(id);
-        });
     }
   });
 };

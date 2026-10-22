@@ -36,6 +36,8 @@ connectDB();
 // Using the 'connected' event works whether connectDB() resolved before or
 // after this line executes (Mongoose buffers and replays the event).
 const mongoose = require('mongoose');
+const { pollBrevoOpens } = require('./services/brevoEventsPoller');
+
 mongoose.connection.once('connected', async () => {
   try {
     const Automation = require('./models/Automation');
@@ -45,6 +47,18 @@ mongoose.connection.once('connected', async () => {
     console.error('Error resetting automation isRunning flags:', err.message);
   }
   startScheduler();
+
+  // Run the poller once shortly after startup
+  if (process.env.ENABLE_SCHEDULER !== 'false') {
+    setTimeout(async () => {
+      console.log('[Server] Running initial Brevo poller pass...');
+      try {
+        await pollBrevoOpens({ daysNormal: 2 });
+      } catch (err) {
+        console.error('[Server] Initial poller run failed:', err.message);
+      }
+    }, 5000); // 5 second delay to let DB settle
+  }
 });
 
 const app = express();
