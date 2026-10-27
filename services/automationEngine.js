@@ -123,6 +123,11 @@ const runAutomation = async (automationId) => {
             automation.lastRunFinderStatus = 'failed';
             automation.lastRunFinderMessage = 'TomTom credits or rate limit reached';
             automation.lastRunFoundCount = finderResult.totalFound || 0;
+          } else if (finderResult.stopReason === 'call_cap') {
+            automation.finderCursor = finderResult.endCursor;
+            automation.lastRunFinderStatus = 'failed';
+            automation.lastRunFinderMessage = 'Reached the search limit for this run';
+            automation.lastRunFoundCount = finderResult.totalFound || 0;
           } else {
             automation.finderCursor = finderResult.endCursor;
             automation.lastRunFinderStatus = 'ok';
@@ -133,7 +138,8 @@ const runAutomation = async (automationId) => {
         } catch (err) {
           console.error(`[AutomationEngine] Lead finding failed for "${automation.name}":`, err.message);
           let failMsg = err.message || 'Lead finding failed';
-          if (failMsg.includes('403') || failMsg.includes('rate') || failMsg.includes('TomTom')) {
+          const httpStatus = err.response?.status;
+          if (httpStatus === 403 || httpStatus === 429) {
             failMsg = 'TomTom credits or rate limit reached';
           }
           if (err.code === 'FINDER_BUSY') {

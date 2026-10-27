@@ -24,11 +24,12 @@
 
 'use strict';
 
-const https   = require('https');
-const axios   = require('axios');
-const cheerio = require('cheerio');
-const Batch   = require('../models/Batch');
-const Lead    = require('../models/Lead');
+const https          = require('https');
+const axios          = require('axios');
+const cheerio        = require('cheerio');
+const Batch          = require('../models/Batch');
+const Lead           = require('../models/Lead');
+const { resolveNicheTerms } = require('./nicheResolver');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -462,11 +463,12 @@ function isDirectoryDomain(domain) {
 
 /**
  * Collect up to `poolTarget` new candidates for a single niche.
- * Continues from where the previous round left off.
+ * Uses per-term round-robin: iterates over the niche's resolved search terms,
+ * cycling through them so no term starves the others. A term with 0 results
+ * on 3 consecutive cities/pages is marked dead for the rest of the run.
  *
- * For a specific city with coordinates: uses POI search by lat/lon (max 6 pages per round).
- * For all-cities Germany: round-robin over GERMANY_CITIES (1 page per city per pass, no fixed page cap).
- * For other countries / text search: uses text search with city='' (max 6 pages per round).
+ * For a specific city: a term that returns 0 on page 1 is dead immediately.
+ * For all-cities Germany: a term needs 3 consecutive 0-result cities.
  *
  * @returns { candidates: Biz[], rateLimited: bool, exhausted: bool }
  */
@@ -482,15 +484,39 @@ async function collectForNiche({
   cancelFlag,
   runStart,
   citiesCoveredMap,
+  searchTomTomFn = searchTomTom,
+  searchTomTomByCoordFn = searchTomTomByCoord,
+  maxCalls = getTomTomMaxCalls(),
 }) {
-  const candidates = [];
-  let rateLimited  = false;
-  let exhausted    = false;
-  let firstCall    = true;
+  const candidates   = [];
+  let rateLimited    = false;
+  let capReached     = false;
+  let exhausted      = false;
+  let firstCall      = true;
   let pagesThisRound = 0;
-  const maxPages = isAllCitiesGermany ? Infinity : MAX_PAGES_SINGLE_CITY;
-  const maxCalls = getTomTomMaxCalls();
+  const maxPages     = isAllCitiesGermany ? Infinity : MAX_PAGES_SINGLE_CITY;
 
+  // ── Per-term state initialisation ─────────────────────────────────────────
+  // nicheState.terms: the resolved search terms (string[])
+  // nicheState.termIdx: next term to use (round-robin index)
+  // nicheState.termConsecZeros: Map<term, consecutiveZeroCount>
+  // nicheState.deadTerms: Set<term> — terms skipped for the rest of the run
+  const terms = (nicheState.terms && nicheState.terms.length > 0)
+    ? nicheState.terms
+    : [niche];  // fallback: use the niche name itself
+
+  if (!nicheState.termConsecZeros)  nicheState.termConsecZeros = new Map();
+  if (!nicheState.deadTerms)        nicheState.deadTerms       = new Set();
+  if (typeof nicheState.termIdx !== 'number') nicheState.termIdx = 0;
+
+  // Per-term offsets for single-city/country text search (separate from the
+  // niche-level offset which is kept for backward-compat cursors without terms)
+  if (!nicheState.termOffsets)      nicheState.termOffsets     = {};
+  if (!nicheState.termCityOffsets)  nicheState.termCityOffsets = {};
+  if (!nicheState.termCityIdx)      nicheState.termCityIdx     = {};
+  if (!nicheState.termExhaustedCities) nicheState.termExhaustedCities = {};
+
+  // ── Main collection loop ───────────────────────────────────────────────────
   while (
     candidates.length < poolTarget &&
     !rateLimited &&
@@ -503,133 +529,185 @@ async function collectForNiche({
     // Check TomTom call budget
     if (tomtomCallCounter.count >= maxCalls) {
       console.log(`[LeadFinder] TomTom call cap (${maxCalls}) reached`);
-      rateLimited = true;
+      capReached = true;
       break;
     }
+
+    // Pick the next live term (round-robin, skip dead ones)
+    const liveTerms = terms.filter(t => !nicheState.deadTerms.has(t));
+    if (liveTerms.length === 0) {
+      // All terms are dead — this niche is exhausted
+      exhausted = true;
+      break;
+    }
+
+    const termIdx   = nicheState.termIdx % liveTerms.length;
+    const activeTerm = liveTerms[termIdx];
+    nicheState.termIdx = (termIdx + 1) % liveTerms.length;
 
     if (!firstCall) await sleep(TOMTOM_CALL_DELAY_MS);
     firstCall = false;
     pagesThisRound++;
 
     let results, rl, exh;
-    let cityName = '';
+    let cityName    = '';
     let cityPageNum = 1;
 
     if (isAllCitiesGermany) {
-      // Round-robin through German cities
-      let foundCity = null;
-      const numCities = GERMANY_CITIES.length;
+      // Round-robin through German cities, per term
+      if (!nicheState.termCityIdx[activeTerm])      nicheState.termCityIdx[activeTerm]      = 0;
+      if (!nicheState.termCityOffsets[activeTerm])  nicheState.termCityOffsets[activeTerm]  = {};
+      if (!nicheState.termExhaustedCities[activeTerm]) nicheState.termExhaustedCities[activeTerm] = [];
+
+      const termExhSet = new Set(nicheState.termExhaustedCities[activeTerm]);
+      const numCities  = GERMANY_CITIES.length;
+      let foundCity    = null;
 
       for (let attempt = 0; attempt < numCities; attempt++) {
-        const candidateIdx = (nicheState.cityIdx + attempt) % numCities;
-        const cityEntry = GERMANY_CITIES[candidateIdx];
-        if (!nicheState.exhaustedCities.has(cityEntry.name)) {
+        const candidateIdx = (nicheState.termCityIdx[activeTerm] + attempt) % numCities;
+        const cityEntry    = GERMANY_CITIES[candidateIdx];
+        if (!termExhSet.has(cityEntry.name)) {
           foundCity = cityEntry;
-          nicheState.cityIdx = (candidateIdx + 1) % numCities;
+          nicheState.termCityIdx[activeTerm] = (candidateIdx + 1) % numCities;
           break;
         }
       }
 
       if (!foundCity) {
-        exhausted = true;
-        break;
+        // Mark term dead
+        nicheState.deadTerms.add(activeTerm);
+        console.log(`[LeadFinder] Term "${activeTerm}" for "${niche}" is dead (all cities exhausted)`);
+        continue;
       }
 
       cityName = foundCity.name;
-      const cityOffset = nicheState.cityOffsets[cityName] || 0;
+      const cityOffset = (nicheState.termCityOffsets[activeTerm][cityName] || 0);
       cityPageNum = Math.floor(cityOffset / TOMTOM_PAGE_SIZE) + 1;
 
-      ({ results, rateLimited: rl, exhausted: exh } = await searchTomTomByCoord({
-        niche,
-        lat: foundCity.lat,
-        lon: foundCity.lon,
+      ({ results, rateLimited: rl, exhausted: exh } = await searchTomTomByCoordFn({
+        niche: activeTerm,
+        lat:   foundCity.lat,
+        lon:   foundCity.lon,
         country: 'Germany',
-        limit: TOMTOM_PAGE_SIZE,
-        offset: cityOffset,
+        limit:   TOMTOM_PAGE_SIZE,
+        offset:  cityOffset,
         tomtomCallCounter,
       }));
 
-      if (rl) {
-        rateLimited = true;
-        break;
-      }
+      if (rl) { rateLimited = true; break; }
 
+      const gotResults = results && results.length > 0;
       if (exh || !results || results.length < TOMTOM_PAGE_SIZE) {
-        nicheState.exhaustedCities.add(cityName);
-        if (nicheState.exhaustedCities.size >= numCities) {
-          exhausted = true;
+        termExhSet.add(cityName);
+        nicheState.termExhaustedCities[activeTerm] = Array.from(termExhSet);
+        if (termExhSet.size >= numCities) {
+          nicheState.deadTerms.add(activeTerm);
+          console.log(`[LeadFinder] Term "${activeTerm}" for "${niche}" exhausted all cities`);
         }
       } else {
-        nicheState.cityOffsets[cityName] = cityOffset + results.length;
+        nicheState.termCityOffsets[activeTerm][cityName] = cityOffset + results.length;
       }
+
+      // Dead-term rule: 3 consecutive 0-result cities → mark dead
+      if (!gotResults) {
+        const prev = nicheState.termConsecZeros.get(activeTerm) || 0;
+        const next = prev + 1;
+        nicheState.termConsecZeros.set(activeTerm, next);
+        if (next >= 3 && !nicheState.deadTerms.has(activeTerm)) {
+          nicheState.deadTerms.add(activeTerm);
+          console.log(`[LeadFinder] Term "${activeTerm}" for "${niche}" marked dead after ${next} consecutive empty cities`);
+        }
+      } else {
+        nicheState.termConsecZeros.set(activeTerm, 0);
+      }
+
+      // Also maintain the global exhaustedCities set (for backward compat)
+      if (termExhSet.size > 0) {
+        for (const c of termExhSet) nicheState.exhaustedCities.add(c);
+      }
+      if (nicheState.exhaustedCities.size >= numCities && liveTerms.length <= 1) {
+        exhausted = true;
+      }
+
     } else if (nicheState.coords) {
       // Specific city with geocoded coordinates
       cityName = city || 'Target City';
-      cityPageNum = Math.floor(nicheState.offset / TOMTOM_PAGE_SIZE) + 1;
+      if (typeof nicheState.termOffsets[activeTerm] !== 'number')
+        nicheState.termOffsets[activeTerm] = 0;
+      cityPageNum = Math.floor(nicheState.termOffsets[activeTerm] / TOMTOM_PAGE_SIZE) + 1;
 
-      ({ results, rateLimited: rl, exhausted: exh } = await searchTomTomByCoord({
-        niche,
-        lat: nicheState.coords.lat,
-        lon: nicheState.coords.lon,
+      ({ results, rateLimited: rl, exhausted: exh } = await searchTomTomByCoordFn({
+        niche:  activeTerm,
+        lat:    nicheState.coords.lat,
+        lon:    nicheState.coords.lon,
         country,
-        limit: TOMTOM_PAGE_SIZE,
-        offset: nicheState.offset,
+        limit:  TOMTOM_PAGE_SIZE,
+        offset: nicheState.termOffsets[activeTerm],
         tomtomCallCounter,
       }));
 
-      if (rl) {
-        rateLimited = true;
-        break;
+      if (rl) { rateLimited = true; break; }
+
+      const gotResults = results && results.length > 0;
+
+      // Dead-term rule: single city → 0 on page 1 = dead immediately
+      if (!gotResults && nicheState.termOffsets[activeTerm] === 0) {
+        nicheState.deadTerms.add(activeTerm);
+        console.log(`[LeadFinder] Term "${activeTerm}" for "${niche}" marked dead (0 results on page 1, single city)`);
+      } else {
+        if (exh || !results || results.length < TOMTOM_PAGE_SIZE) {
+          nicheState.deadTerms.add(activeTerm);
+        }
+        nicheState.termOffsets[activeTerm] += (results?.length || 0);
       }
-      if (exh || !results || results.length < TOMTOM_PAGE_SIZE) {
-        exhausted = true;
+
+      // Also keep legacy offset in sync for first term (cursor compat)
+      if (activeTerm === terms[0]) {
+        nicheState.offset = nicheState.termOffsets[activeTerm];
       }
-      nicheState.offset += (results?.length || 0);
+
     } else {
       // Country-wide text search
       cityName = city || country || 'All';
-      cityPageNum = Math.floor(nicheState.offset / TOMTOM_PAGE_SIZE) + 1;
+      if (typeof nicheState.termOffsets[activeTerm] !== 'number')
+        nicheState.termOffsets[activeTerm] = 0;
+      cityPageNum = Math.floor(nicheState.termOffsets[activeTerm] / TOMTOM_PAGE_SIZE) + 1;
 
-      ({ results, rateLimited: rl, exhausted: exh } = await searchTomTom({
-        niche,
+      ({ results, rateLimited: rl, exhausted: exh } = await searchTomTomFn({
+        niche:  activeTerm,
         country,
         city,
-        limit: TOMTOM_PAGE_SIZE,
-        offset: nicheState.offset,
+        limit:  TOMTOM_PAGE_SIZE,
+        offset: nicheState.termOffsets[activeTerm],
         tomtomCallCounter,
       }));
 
-      if (rl) {
-        rateLimited = true;
-        break;
-      }
+      if (rl) { rateLimited = true; break; }
+
+      const gotResults = results && results.length > 0;
+
       if (exh || !results || results.length < TOMTOM_PAGE_SIZE) {
-        exhausted = true;
+        nicheState.deadTerms.add(activeTerm);
+      } else {
+        nicheState.termOffsets[activeTerm] += results.length;
       }
-      nicheState.offset += (results?.length || 0);
+
+      // Keep legacy offset in sync for first term
+      if (activeTerm === terms[0]) {
+        nicheState.offset = nicheState.termOffsets[activeTerm];
+      }
     }
 
-    // Filter and dedupe
+    // ── Filter and dedupe ──────────────────────────────────────────────────
     let withWebsite = 0, skippedNoWebsite = 0, skippedDir = 0, skippedDup = 0, kept = 0;
     for (const r of (results || []).map(parseTomTomResult)) {
-      if (!r.website) {
-        skippedNoWebsite++;
-        continue;
-      }
+      if (!r.website) { skippedNoWebsite++; continue; }
       withWebsite++;
       const domain = getDomain(r.website);
-      if (!domain || isDirectoryDomain(domain)) {
-        skippedDir++;
-        continue;
-      }
-      if (seenDomains.has(domain)) {
-        skippedDup++;
-        continue;
-      }
+      if (!domain || isDirectoryDomain(domain)) { skippedDir++; continue; }
+      if (seenDomains.has(domain))               { skippedDup++; continue; }
       seenDomains.add(domain);
-      if (isAllCitiesGermany && !r.city && cityName) {
-        r.city = cityName;
-      }
+      if (isAllCitiesGermany && !r.city && cityName) r.city = cityName;
       candidates.push(r);
       kept++;
 
@@ -641,10 +719,21 @@ async function collectForNiche({
       if (candidates.length >= poolTarget) break;
     }
 
-    console.log(`[LeadFinder] [${cityName}] [${niche}] page ${cityPageNum} | results=${results?.length || 0} | withWebsite=${withWebsite} | noWebsite=${skippedNoWebsite} | dirSkip=${skippedDir} | dupSkip=${skippedDup} | kept=${kept} (nichePool=${candidates.length}/${poolTarget})`);
+    console.log(
+      `[LeadFinder] [${cityName}] [${niche}→${activeTerm}] page ${cityPageNum}` +
+      ` | results=${results?.length || 0} | withWebsite=${withWebsite}` +
+      ` | noWebsite=${skippedNoWebsite} | dirSkip=${skippedDir} | dupSkip=${skippedDup}` +
+      ` | kept=${kept} (nichePool=${candidates.length}/${poolTarget})`,
+    );
+
+    // If all live terms are now dead, exit
+    if (terms.every(t => nicheState.deadTerms.has(t))) {
+      exhausted = true;
+      break;
+    }
   }
 
-  return { candidates, rateLimited, exhausted };
+  return { candidates, rateLimited, capReached, exhausted };
 }
 
 // ── Quota redistribution helper ──────────────────────────────────────────────
@@ -712,6 +801,7 @@ const runMultiNicheSearch = async ({
   onRoundDone,
   cursor,
   batchNamePrefix,
+  dependencies = {},
 }) => {
   if (!acquireLeadFinderLock()) {
     const err = new Error('Another lead finder run was in progress');
@@ -720,30 +810,38 @@ const runMultiNicheSearch = async ({
   }
 
   try {
+    const BatchModel = dependencies.Batch || Batch;
+    const LeadModel = dependencies.Lead || Lead;
+    const resolveNiche = dependencies.resolveNicheTerms || resolveNicheTerms;
+    const geocode = dependencies.geocodeCity || geocodeCity;
+    const searchText = dependencies.searchTomTom || searchTomTom;
+    const searchCoord = dependencies.searchTomTomByCoord || searchTomTomByCoord;
+    const scrapeSite = dependencies.scrapeEmailForSite || scrapeEmailForSite;
+    const maxTomTomCalls = dependencies.getTomTomMaxCalls || getTomTomMaxCalls;
     const onProgress   = typeof rawProgress    === 'function' ? rawProgress    : () => {};
     const isCancelled  = () => cancelFlag?.cancelled === true;
     const notifyBatch  = typeof onBatchCreated === 'function' ? onBatchCreated : () => {};
     const notifyRound  = typeof onRoundDone    === 'function' ? onRoundDone    : () => {};
 
     const runStart = Date.now();
-    const elapsed  = () => Math.round((Date.now() - runStart) / 1000);
+    const elapsed      = () => Math.round((Date.now() - runStart) / 1000);
     const timeLimitHit = () => (Date.now() - runStart) >= TIME_LIMIT_MS;
 
     const isAllCitiesGermany = !city && country.toLowerCase().includes('germany');
     const locationLabel      = city || (isAllCitiesGermany ? 'All cities' : country);
     const nicheLabel         = niches.join(', ');
 
-    console.log(`[LeadFinder] ── Starting multi-round pipeline ──────────────────────`);
+    console.log(`[LeadFinder] \u2500\u2500 Starting multi-round pipeline \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500`);
     console.log(`[LeadFinder] project:${projectId} | location:${locationLabel} | niches:[${nicheLabel}] | target:${totalLeads}`);
 
-    // ── Pre-load project domains and emails ────────────────────────────────────
-    const existingBatches  = await Batch.find({ projectId }, '_id');
+    // \u2500\u2500 Pre-load project domains and emails \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    const existingBatches  = await BatchModel.find({ projectId }, '_id');
     const existingBatchIds = existingBatches.map(b => b._id);
     const seenDomains      = new Set();
     const seenEmails       = new Set();
 
     if (existingBatchIds.length > 0) {
-      const existing = await Lead.find(
+      const existing = await LeadModel.find(
         { batchId: { $in: existingBatchIds }, email: { $exists: true, $ne: '' } },
         'email website',
       ).lean();
@@ -754,47 +852,80 @@ const runMultiNicheSearch = async ({
       console.log(`[LeadFinder] Pre-loaded ${seenDomains.size} domains, ${seenEmails.size} emails for dedup`);
     }
 
-    // ── Geocode city (once, before rounds) ────────────────────────────────────
+    // \u2500\u2500 Geocode city (once, before rounds) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     const tomtomCallCounter = { count: 0 };
     let cityCoords = null;
     if (city && city.trim()) {
-      cityCoords = await geocodeCity(city, country, tomtomCallCounter);
+      cityCoords = await geocode(city, country, tomtomCallCounter);
       if (cityCoords) {
         console.log(`[LeadFinder] Geocoded "${city}": lat=${cityCoords.lat} lon=${cityCoords.lon}`);
       } else {
-        console.warn(`[LeadFinder] Geocode failed for "${city}" — falling back to text search`);
+        console.warn(`[LeadFinder] Geocode failed for "${city}" \u2014 falling back to text search`);
       }
     }
 
-    // ── Per-niche state (persists across rounds, resumed from cursor if present)
+    // \u2500\u2500 Niche resolution (Phase 0): translate niches to local-language terms \u2500\u2500\u2500\u2500
+    // resolveNicheTerms never throws; worst case returns [original text]
+    console.log(`[LeadFinder] Resolving ${niches.length} niche(s) for country "${country}"...`);
+    const resolvedNiches = await Promise.all(
+      niches.map(n => resolveNiche(n, country)),
+    );
+    const nicheResolutionMap = new Map(resolvedNiches.map(r => [r.original, r]));
+
+    // \u2500\u2500 Per-niche state (persists across rounds, resumed from cursor if present)
     const quotas     = distribute(totalLeads, niches.length);  // initial per-niche targets
     const nicheStates = niches.map((niche, i) => {
       const savedCursor = (cursor && cursor[niche]) ? cursor[niche] : null;
+      const resolution  = nicheResolutionMap.get(niche) || { terms: [niche], source: 'fallback' };
+
       const initialExhaustedCities = savedCursor && Array.isArray(savedCursor.exhaustedCities)
-        ? new Set(savedCursor.exhaustedCities)
-        : new Set();
+        ? new Set(savedCursor.exhaustedCities) : new Set();
       const initialCityOffsets = (savedCursor && savedCursor.cityOffsets && typeof savedCursor.cityOffsets === 'object')
-        ? { ...savedCursor.cityOffsets }
-        : {};
+        ? { ...savedCursor.cityOffsets } : {};
       const initialOffset = (savedCursor && typeof savedCursor.offset === 'number')
-        ? savedCursor.offset
-        : 0;
+        ? savedCursor.offset : 0;
       const initialCityIdx = (savedCursor && typeof savedCursor.cityIdx === 'number')
-        ? savedCursor.cityIdx
-        : 0;
+        ? savedCursor.cityIdx : 0;
+
+      // Backward-compatible: old cursors may not have term state; start fresh if missing
+      const initialTermIdx  = (savedCursor && typeof savedCursor.termIdx === 'number')
+        ? savedCursor.termIdx : 0;
+      const initialTermOffsets = (savedCursor && savedCursor.termOffsets && typeof savedCursor.termOffsets === 'object')
+        ? { ...savedCursor.termOffsets } : {};
+      const initialTermCityIdx = (savedCursor && savedCursor.termCityIdx && typeof savedCursor.termCityIdx === 'object')
+        ? { ...savedCursor.termCityIdx } : {};
+      const initialTermCityOffsets = (savedCursor && savedCursor.termCityOffsets && typeof savedCursor.termCityOffsets === 'object')
+        ? JSON.parse(JSON.stringify(savedCursor.termCityOffsets)) : {};
+      const initialTermExhCities = (savedCursor && savedCursor.termExhaustedCities && typeof savedCursor.termExhaustedCities === 'object')
+        ? JSON.parse(JSON.stringify(savedCursor.termExhaustedCities)) : {};
+      const initialDeadTerms = (savedCursor && Array.isArray(savedCursor.deadTerms))
+        ? new Set(savedCursor.deadTerms) : new Set();
+      // Use saved terms from cursor (avoids re-calling AI on automation resume)
+      const initialTerms = (savedCursor && Array.isArray(savedCursor.terms) && savedCursor.terms.length > 0)
+        ? savedCursor.terms : resolution.terms;
 
       return {
         niche,
-        target:          quotas[i],    // valid leads needed from this niche
-        saved:           0,            // valid leads saved so far from this niche
-        offset:          initialOffset, // TomTom pagination offset (for single city/country text search)
-        cityIdx:         initialCityIdx, // Germany all-cities round-robin index
-        cityOffsets:     initialCityOffsets, // per-city offset map for Germany all-cities: { [cityName]: number }
-        exhaustedCities: initialExhaustedCities, // per-niche set of exhausted German cities
-        round:           1,            // current round number
-        coords:          cityCoords,   // geocoded lat/lon for specific city (or null)
-        exhausted:       Boolean(savedCursor?.exhausted), // true = no more TomTom results
-        prevYield:       null,         // { valid, scraped } from last round for pool sizing
+        target:              quotas[i],
+        saved:               0,
+        offset:              initialOffset,
+        cityIdx:             initialCityIdx,
+        cityOffsets:         initialCityOffsets,
+        exhaustedCities:     initialExhaustedCities,
+        round:               1,
+        coords:              cityCoords,
+        exhausted:           Boolean(savedCursor?.exhausted),
+        prevYield:           null,
+        // Per-term state
+        terms:               initialTerms,
+        termsSource:         resolution.source,
+        termIdx:             initialTermIdx,
+        termOffsets:         initialTermOffsets,
+        termCityIdx:         initialTermCityIdx,
+        termCityOffsets:     initialTermCityOffsets,
+        termExhaustedCities: initialTermExhCities,
+        deadTerms:           initialDeadTerms,
+        termConsecZeros:     new Map(),
       };
     });
 
@@ -810,7 +941,7 @@ const runMultiNicheSearch = async ({
   for (let roundNum = 1; roundNum <= MAX_ROUNDS; roundNum++) {
     if (isCancelled())  { stopReason = 'cancelled';   break; }
     if (timeLimitHit()) { stopReason = 'time_limit';  break; }
-    if (tomtomCallCounter.count >= getTomTomMaxCalls()) { stopReason = 'rate_limit'; break; }
+    if (tomtomCallCounter.count >= maxTomTomCalls()) { stopReason = 'call_cap'; break; }
 
     const activeNiches = nicheStates.filter(ns => !ns.exhausted && ns.target > ns.saved);
     if (activeNiches.length === 0) { stopReason = 'all_niches_exhausted'; break; }
@@ -839,17 +970,19 @@ const runMultiNicheSearch = async ({
     // ── Phase 1: collect candidates ───────────────────────────────────────
     let roundCandidates = [];
     let rateLimited     = false;
+    let capReached      = false;
 
     for (let ni = 0; ni < activeNiches.length; ni++) {
       const ns    = activeNiches[ni];
       const pSize = poolPerNiche[ni];
-      if (isCancelled() || timeLimitHit() || tomtomCallCounter.count >= getTomTomMaxCalls()) {
-        rateLimited = tomtomCallCounter.count >= getTomTomMaxCalls();
+      if (isCancelled() || timeLimitHit() || tomtomCallCounter.count >= maxTomTomCalls()) {
+        capReached = tomtomCallCounter.count >= maxTomTomCalls();
         break;
       }
 
+
       ns.round = roundNum;
-      const { candidates, rateLimited: rl, exhausted } = await collectForNiche({
+      const { candidates, rateLimited: rl, capReached: cap, exhausted } = await collectForNiche({
         niche:               ns.niche,
         city,
         country,
@@ -861,6 +994,9 @@ const runMultiNicheSearch = async ({
         cancelFlag,
         runStart,
         citiesCoveredMap,
+        searchTomTomFn: searchText,
+        searchTomTomByCoordFn: searchCoord,
+        maxCalls: maxTomTomCalls(),
       });
 
       if (exhausted) {
@@ -868,6 +1004,8 @@ const runMultiNicheSearch = async ({
         redistributeExhaustedQuotas(nicheStates);
       }
       if (rl) { rateLimited = true; }
+      if (cap) { capReached = true; }
+      if (tomtomCallCounter.count >= maxTomTomCalls()) { capReached = true; }
 
       // Tag candidates with their niche
       for (const c of candidates) { c._niche = ns.niche; c._nicheIdx = ni; }
@@ -877,17 +1015,23 @@ const runMultiNicheSearch = async ({
       onProgress({ round: roundNum, collecting: true, niche: ns.niche, totalSaved, target: totalLeads });
     }
 
-    if (rateLimited && roundCandidates.length === 0) {
-      stopReason = 'rate_limit'; break;
+    if ((rateLimited || capReached) && roundCandidates.length === 0) {
+      stopReason = rateLimited ? 'rate_limit' : 'call_cap'; break;
     }
 
     console.log(`[LeadFinder] Round ${roundNum} Phase 1 done: ${roundCandidates.length} candidates | ${elapsed()}s`);
 
     if (roundCandidates.length === 0) {
       if (activeNiches.every(ns => ns.exhausted)) {
-        stopReason = 'no_candidates';
-      } else if (tomtomCallCounter.count >= getTomTomMaxCalls()) {
+        // Check if all terms across all niches were dead
+        const allTermsDead = nicheStates.every(
+          ns => ns.deadTerms && ns.terms && ns.terms.every(t => ns.deadTerms.has(t)),
+        );
+        stopReason = allTermsDead ? 'all_terms_empty' : 'no_candidates';
+      } else if (rateLimited) {
         stopReason = 'rate_limit';
+      } else if (capReached || tomtomCallCounter.count >= maxTomTomCalls()) {
+        stopReason = 'call_cap';
       }
       break;
     }
@@ -906,7 +1050,7 @@ const runMultiNicheSearch = async ({
 
       const bSlice = roundCandidates.slice(bStart, bStart + SCRAPE_CONCURRENCY);
       const jobs   = bSlice.map(biz => async () => {
-        const email = await scrapeEmailForSite(biz.website, fetchErrorCounts);
+        const email = await scrapeSite(biz.website, fetchErrorCounts);
         return { biz, email };
       });
       const results = await runInBatches(jobs, SCRAPE_CONCURRENCY);
@@ -957,7 +1101,7 @@ const runMultiNicheSearch = async ({
         } else {
           batchName = `${locationLabel} - Multi-Niche (${nicheLabel})`;
         }
-        const batch = new Batch({
+        const batch = new BatchModel({
           name: batchName, projectId, source: 'Lead Finder Agent', leadCount: 0,
         });
         await batch.save();
@@ -966,7 +1110,7 @@ const runMultiNicheSearch = async ({
         console.log(`[LeadFinder] Created batch "${batchName}" (${batchId})`);
       }
 
-      await Lead.insertMany(leadsToSave.map(l => ({
+      await LeadModel.insertMany(leadsToSave.map(l => ({
         batchId,
         company: l.biz.name,
         city:    l.biz.city || city || country,
@@ -985,7 +1129,7 @@ const runMultiNicheSearch = async ({
       totalSaved += leadsToSave.length;
 
       // Update batch leadCount
-      await Batch.updateOne({ _id: batchId }, { leadCount: totalSaved });
+      await BatchModel.updateOne({ _id: batchId }, { leadCount: totalSaved });
       console.log(`[LeadFinder] Round ${roundNum}: saved ${leadsToSave.length} leads (total=${totalSaved})`);
     }
 
@@ -1007,6 +1151,7 @@ const runMultiNicheSearch = async ({
     // ── Check stop conditions after round ───────────────────────────────
     if (totalSaved >= totalLeads) { stopReason = 'target_reached'; break; }
     if (rateLimited)              { stopReason = 'rate_limit';     break; }
+    if (capReached || tomtomCallCounter.count >= maxTomTomCalls()) { stopReason = 'call_cap'; break; }
     if (leadsToSave.length === 0) { stopReason = 'no_new_leads';   break; }
     if (isCancelled())            { stopReason = 'cancelled';      break; }
     if (timeLimitHit())           { stopReason = 'time_limit';     break; }
@@ -1025,11 +1170,19 @@ const runMultiNicheSearch = async ({
   const endCursor = {};
   for (const ns of nicheStates) {
     endCursor[ns.niche] = {
-      offset:          ns.offset || 0,
-      cityIdx:         ns.cityIdx || 0,
-      cityOffsets:     { ...(ns.cityOffsets || {}) },
-      exhaustedCities: Array.from(ns.exhaustedCities || []),
-      exhausted:       Boolean(ns.exhausted),
+      offset:               ns.offset || 0,
+      cityIdx:              ns.cityIdx || 0,
+      cityOffsets:          { ...(ns.cityOffsets || {}) },
+      exhaustedCities:      Array.from(ns.exhaustedCities || []),
+      exhausted:            Boolean(ns.exhausted),
+      // Per-term state (new; absent in old cursors → handled on load)
+      termIdx:              ns.termIdx || 0,
+      termOffsets:          { ...(ns.termOffsets || {}) },
+      termCityIdx:          { ...(ns.termCityIdx || {}) },
+      termCityOffsets:      ns.termCityOffsets ? JSON.parse(JSON.stringify(ns.termCityOffsets)) : {},
+      termExhaustedCities:  ns.termExhaustedCities ? JSON.parse(JSON.stringify(ns.termExhaustedCities)) : {},
+      deadTerms:            Array.from(ns.deadTerms || []),
+      terms:                ns.terms || [],
     };
   }
   const allNichesExhausted = nicheStates.every(ns => ns.exhausted);
@@ -1054,6 +1207,12 @@ const runMultiNicheSearch = async ({
       validFound:   ns.saved,
       totalChecked: allRoundStats.reduce((s, r) => s + (r.candidates || 0), 0),
       exhausted:    ns.exhausted,
+    })),
+    // New: shows what terms were used for each niche
+    searchTerms: nicheStates.map(ns => ({
+      niche:  ns.niche,
+      terms:  ns.terms  || [ns.niche],
+      source: ns.termsSource || 'fallback',
     })),
   };
 
