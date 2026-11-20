@@ -6,7 +6,7 @@
  * Brevo replaces it with a blank and the email still goes out.
  *
  * Allowed names (case-sensitive, same as the Templates page buttons):
- *   companyName, company, firstName, name, email, city, website, senderName
+ *   companyName, company, firstName, name, email, city, website, senderName, websiteIssue
  */
 
 'use strict';
@@ -20,12 +20,13 @@ const ALLOWED_VARIABLES = new Set([
   'city',
   'website',
   'senderName',
+  'websiteIssue',
 ]);
 
 const TAG_PATTERN = /\{\{\s*([^{}]+?)\s*\}\}/g;
 
 const ALLOWED_LIST_TEXT =
-  '{{companyName}}, {{firstName}}, {{city}}, {{website}}, {{email}}, {{senderName}}';
+  '{{companyName}}, {{firstName}}, {{city}}, {{website}}, {{email}}, {{senderName}}, {{websiteIssue}}';
 
 function findTemplateTags(text) {
   if (!text) return [];
@@ -83,7 +84,8 @@ function replaceTemplateVariables(text, lead = {}, project = {}) {
     .replace(/\{\{\s*email\s*\}\}/g, lead.email || '[Email]')
     .replace(/\{\{\s*city\s*\}\}/g, lead.city || '[City]')
     .replace(/\{\{\s*website\s*\}\}/g, lead.website || '[Website]')
-    .replace(/\{\{\s*senderName\s*\}\}/g, sender);
+    .replace(/\{\{\s*senderName\s*\}\}/g, sender)
+    .replace(/\{\{\s*websiteIssue\s*\}\}/g, lead.websiteIssue || 'your website could bring in more local customers');
 }
 
 module.exports = {

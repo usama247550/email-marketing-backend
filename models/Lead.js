@@ -34,6 +34,13 @@ const leadSchema = new mongoose.Schema({
     trim: true,
     default: ''
   },
+  // One plain sentence about the website, filled by the lead finder.
+  // Templates can insert it with {{websiteIssue}}.
+  websiteIssue: {
+    type: String,
+    trim: true,
+    default: ''
+  },
   // Why the AI decided this lead matches the search criteria (Smart Search only)
   matchReason: {
     type: String,

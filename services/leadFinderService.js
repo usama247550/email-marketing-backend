@@ -46,10 +46,15 @@ const SCRAPE_CONCURRENCY   = 20;
 const FETCH_TIMEOUT_MS     = 8_000;
 const SITE_BUDGET_MS       = 25_000;
 const MAX_RESPONSE_BYTES   = 2 * 1024 * 1024;
-const CONTACT_PATHS_ORDERED = [
+const CONTACT_PATHS_GERMANY = [
   '/impressum', '/kontakt', '/contact', '/imprint',
   '/impressum.html', '/kontakt.html', '/rechtliches', '/about',
 ];
+const CONTACT_PATHS_USA = [
+  '/contact', '/contact-us', '/contactus', '/about', '/about-us',
+  '/get-in-touch', '/reach-us',
+];
+const CONTACT_PATHS_ORDERED = CONTACT_PATHS_GERMANY;
 
 // HARD_CAP_PER_NICHE kept for export (used by smart search legacy path)
 const HARD_CAP_PER_NICHE = 400;
@@ -61,6 +66,8 @@ const DIRECTORY_DOMAINS = new Set([
   'stadtbranchenbuch.com', 'branchen-info.net', 'yelp.de', 'yelp.com',
   'cylex.de', 'goyellow.de', 'gelbe-seiten.de', 'klicktel.de',
   'dastelefonbuch.de', 'herold.at', 'local.ch', 'swisscom.ch',
+  'yellowpages.com', 'superpages.com', 'whitepages.com', 'bbb.org',
+  'manta.com', 'mapquest.com', 'citysearch.com',
 ]);
 
 // German cities for "All cities" mode (lat, lon pairs)
@@ -96,6 +103,83 @@ const GERMANY_CITIES = [
   { name: 'Kiel',            lat: 54.3233, lon: 10.1228 },
   { name: 'Aachen',          lat: 50.7753, lon:  6.0839 },
 ];
+
+// Major US cities for "All cities" mode. Same idea as the Germany list.
+const USA_CITIES = [
+  { name: 'New York',      lat: 40.7128, lon: -74.0060 },
+  { name: 'Los Angeles',   lat: 34.0522, lon: -118.2437 },
+  { name: 'Chicago',       lat: 41.8781, lon: -87.6298 },
+  { name: 'Houston',       lat: 29.7604, lon: -95.3698 },
+  { name: 'Phoenix',       lat: 33.4484, lon: -112.0740 },
+  { name: 'Philadelphia',  lat: 39.9526, lon: -75.1652 },
+  { name: 'San Antonio',   lat: 29.4241, lon: -98.4936 },
+  { name: 'San Diego',     lat: 32.7157, lon: -117.1611 },
+  { name: 'Dallas',        lat: 32.7767, lon: -96.7970 },
+  { name: 'Austin',        lat: 30.2672, lon: -97.7431 },
+  { name: 'Jacksonville',  lat: 30.3322, lon: -81.6557 },
+  { name: 'San Jose',      lat: 37.3382, lon: -121.8863 },
+  { name: 'Columbus',      lat: 39.9612, lon: -82.9988 },
+  { name: 'Charlotte',     lat: 35.2271, lon: -80.8431 },
+  { name: 'Seattle',       lat: 47.6062, lon: -122.3321 },
+  { name: 'Denver',        lat: 39.7392, lon: -104.9903 },
+  { name: 'Boston',        lat: 42.3601, lon: -71.0589 },
+  { name: 'Nashville',     lat: 36.1627, lon: -86.7816 },
+  { name: 'Atlanta',       lat: 33.7490, lon: -84.3880 },
+  { name: 'Miami',         lat: 25.7617, lon: -80.1918 },
+  { name: 'Las Vegas',     lat: 36.1699, lon: -115.1398 },
+  { name: 'Portland',      lat: 45.5152, lon: -122.6784 },
+  { name: 'Minneapolis',   lat: 44.9778, lon: -93.2650 },
+];
+
+function countryKey(country) {
+  return String(country || '').trim().toLowerCase();
+}
+
+function countryCode(country) {
+  const name = countryKey(country);
+  if (name.includes('germany') || name.includes('deutschland')) return 'DE';
+  if (
+    name === 'united states' || name === 'united states of america' ||
+    name === 'usa' || name === 'us' || name === 'america'
+  ) return 'US';
+  return undefined;
+}
+
+function citiesForCountry(country) {
+  const code = countryCode(country);
+  if (code === 'DE') return GERMANY_CITIES;
+  if (code === 'US') return USA_CITIES;
+  return null;
+}
+
+function contactPathsFor(country) {
+  return countryCode(country) === 'US' ? CONTACT_PATHS_USA : CONTACT_PATHS_GERMANY;
+}
+
+const GENERIC_WEBSITE_ISSUE = 'your website could bring in more local customers';
+
+function detectWebsiteIssue(html, finalUrl) {
+  if (!html) return GENERIC_WEBSITE_ISSUE;
+  try {
+    const $ = cheerio.load(html);
+    const secure = String(finalUrl || '').startsWith('https://');
+    const hasViewport = $('meta[name="viewport"]').length > 0;
+    const description = ($('meta[name="description"]').attr('content') || '').trim();
+    const title = $('title').first().text().trim();
+    const yearMatch = $.text().match(/(?:©|copyright|\(c\))[^0-9]{0,40}((?:19|20)\d{2})/i);
+    const year = yearMatch ? parseInt(yearMatch[1], 10) : null;
+    const oldYear = year && year <= new Date().getFullYear() - 3;
+
+    if (!secure) return 'your site is not using a secure https connection';
+    if (!hasViewport) return 'your site is difficult to use on a phone';
+    if (!description) return 'your Google listing is missing a short description';
+    if (oldYear) return `your site still shows a copyright year of ${year}`;
+    if (!title) return 'your page is missing a title, so Google has less to show';
+    return GENERIC_WEBSITE_ISSUE;
+  } catch {
+    return GENERIC_WEBSITE_ISSUE;
+  }
+}
 
 // ── Tiny helpers ──────────────────────────────────────────────────────────────
 
@@ -303,7 +387,8 @@ async function fetchPageWithRetry(rawUrl) {
 
 // ── Email scraper (homepage + contact pages) ──────────────────────────────────
 
-async function scrapeEmailForSite(rawUrl, fetchErrorCounts) {
+async function scrapeEmailForSite(rawUrl, fetchErrorCounts, country = '') {
+  const paths = contactPathsFor(country);
   const homeFetch = await fetchPageWithRetry(rawUrl);
   if (!homeFetch || homeFetch.fetchError) {
     if (fetchErrorCounts && homeFetch?.fetchError?.code) {
@@ -314,7 +399,8 @@ async function scrapeEmailForSite(rawUrl, fetchErrorCounts) {
   }
 
   const homeEmails = extractEmailsFromHtml(homeFetch.html);
-  if (homeEmails.length > 0) return homeEmails[0];
+  const websiteIssue = detectWebsiteIssue(homeFetch.html, homeFetch.finalUrl);
+  if (homeEmails.length > 0) return { email: homeEmails[0], websiteIssue };
 
   // Prefer real links found in homepage, then guessed paths
   let origin, finalUrl;
@@ -329,7 +415,7 @@ async function scrapeEmailForSite(rawUrl, fetchErrorCounts) {
     if (toProbe.length >= 2) return false;
     const href  = ($(el).attr('href') || '').trim();
     const lower = href.toLowerCase();
-    if (!CONTACT_PATHS_ORDERED.some(p => lower === p || lower.startsWith(p + '/') ||
+    if (!paths.some(p => lower === p || lower.startsWith(p + '/') ||
         lower.startsWith(p + '?') || lower.endsWith(p))) return;
     try {
       const abs  = new URL(href, finalUrl).href;
@@ -339,7 +425,7 @@ async function scrapeEmailForSite(rawUrl, fetchErrorCounts) {
   });
 
   // Fill from guessed paths
-  for (const path of CONTACT_PATHS_ORDERED) {
+  for (const path of paths) {
     if (toProbe.length >= 2) break;
     if (visited.has(path)) continue;
     visited.add(path);
@@ -356,7 +442,7 @@ async function scrapeEmailForSite(rawUrl, fetchErrorCounts) {
       continue;
     }
     const emails = extractEmailsFromHtml(page.html);
-    if (emails.length > 0) return emails[0];
+    if (emails.length > 0) return { email: emails[0], websiteIssue };
   }
 
   return null;
@@ -424,7 +510,7 @@ async function searchTomTomByCoord({ niche, lat, lon, country, limit, offset, to
       params: {
         key: apiKey, limit: safeLimit, offset,
         lat, lon, radius: 15000,
-        countrySet: country === 'Germany' ? 'DE' : undefined,
+        countrySet: countryCode(country),
       },
     });
     const results = resp.data?.results || [];
@@ -481,6 +567,7 @@ async function collectForNiche({
   nicheState,
   tomtomCallCounter,
   isAllCitiesGermany,
+  cityList,
   cancelFlag,
   runStart,
   citiesCoveredMap,
@@ -494,7 +581,11 @@ async function collectForNiche({
   let exhausted      = false;
   let firstCall      = true;
   let pagesThisRound = 0;
-  const maxPages     = isAllCitiesGermany ? Infinity : MAX_PAGES_SINGLE_CITY;
+  const rotatingCities = (Array.isArray(cityList) && cityList.length > 0)
+    ? cityList
+    : (isAllCitiesGermany ? GERMANY_CITIES : null);
+  const useCityRotation = Boolean(rotatingCities);
+  const maxPages     = useCityRotation ? Infinity : MAX_PAGES_SINGLE_CITY;
 
   // ── Per-term state initialisation ─────────────────────────────────────────
   // nicheState.terms: the resolved search terms (string[])
@@ -553,19 +644,19 @@ async function collectForNiche({
     let cityName    = '';
     let cityPageNum = 1;
 
-    if (isAllCitiesGermany) {
-      // Round-robin through German cities, per term
+    if (useCityRotation) {
+      // Round-robin through the country's major cities, per term
       if (!nicheState.termCityIdx[activeTerm])      nicheState.termCityIdx[activeTerm]      = 0;
       if (!nicheState.termCityOffsets[activeTerm])  nicheState.termCityOffsets[activeTerm]  = {};
       if (!nicheState.termExhaustedCities[activeTerm]) nicheState.termExhaustedCities[activeTerm] = [];
 
       const termExhSet = new Set(nicheState.termExhaustedCities[activeTerm]);
-      const numCities  = GERMANY_CITIES.length;
+      const numCities  = rotatingCities.length;
       let foundCity    = null;
 
       for (let attempt = 0; attempt < numCities; attempt++) {
         const candidateIdx = (nicheState.termCityIdx[activeTerm] + attempt) % numCities;
-        const cityEntry    = GERMANY_CITIES[candidateIdx];
+        const cityEntry    = rotatingCities[candidateIdx];
         if (!termExhSet.has(cityEntry.name)) {
           foundCity = cityEntry;
           nicheState.termCityIdx[activeTerm] = (candidateIdx + 1) % numCities;
@@ -588,7 +679,7 @@ async function collectForNiche({
         niche: activeTerm,
         lat:   foundCity.lat,
         lon:   foundCity.lon,
-        country: 'Germany',
+        country,
         limit:   TOMTOM_PAGE_SIZE,
         offset:  cityOffset,
         tomtomCallCounter,
@@ -707,7 +798,7 @@ async function collectForNiche({
       if (!domain || isDirectoryDomain(domain)) { skippedDir++; continue; }
       if (seenDomains.has(domain))               { skippedDup++; continue; }
       seenDomains.add(domain);
-      if (isAllCitiesGermany && !r.city && cityName) r.city = cityName;
+      if (useCityRotation && !r.city && cityName) r.city = cityName;
       candidates.push(r);
       kept++;
 
@@ -827,8 +918,9 @@ const runMultiNicheSearch = async ({
     const elapsed      = () => Math.round((Date.now() - runStart) / 1000);
     const timeLimitHit = () => (Date.now() - runStart) >= TIME_LIMIT_MS;
 
-    const isAllCitiesGermany = !city && country.toLowerCase().includes('germany');
-    const locationLabel      = city || (isAllCitiesGermany ? 'All cities' : country);
+    const rotatingCities = !city ? citiesForCountry(country) : null;
+    const isAllCitiesGermany = Boolean(rotatingCities);
+    const locationLabel      = city || (rotatingCities ? 'All cities' : country);
     const nicheLabel         = niches.join(', ');
 
     console.log(`[LeadFinder] \u2500\u2500 Starting multi-round pipeline \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500`);
@@ -991,6 +1083,7 @@ const runMultiNicheSearch = async ({
         nicheState:          ns,
         tomtomCallCounter,
         isAllCitiesGermany,
+        cityList: rotatingCities,
         cancelFlag,
         runStart,
         citiesCoveredMap,
@@ -1050,8 +1143,10 @@ const runMultiNicheSearch = async ({
 
       const bSlice = roundCandidates.slice(bStart, bStart + SCRAPE_CONCURRENCY);
       const jobs   = bSlice.map(biz => async () => {
-        const email = await scrapeSite(biz.website, fetchErrorCounts);
-        return { biz, email };
+        const scraped = await scrapeSite(biz.website, fetchErrorCounts, country);
+        const email = typeof scraped === 'string' ? scraped : scraped?.email;
+        const websiteIssue = scraped && typeof scraped === 'object' ? scraped.websiteIssue : '';
+        return { biz, email, websiteIssue };
       });
       const results = await runInBatches(jobs, SCRAPE_CONCURRENCY);
       roundScraped += bSlice.length;
@@ -1065,7 +1160,12 @@ const runMultiNicheSearch = async ({
         if (totalSaved + roundLeads.length >= totalLeads) break;
 
         seenEmails.add(norm);
-        roundLeads.push({ biz: r.biz, email: norm, niche: r.biz._niche || niches[0] });
+        roundLeads.push({
+          biz: r.biz,
+          email: norm,
+          niche: r.biz._niche || niches[0],
+          websiteIssue: r.websiteIssue || GENERIC_WEBSITE_ISSUE,
+        });
         roundValid++;
       }
 
@@ -1117,6 +1217,7 @@ const runMultiNicheSearch = async ({
         website: l.biz.website || '',
         email:   l.email,
         niche:   l.niche,
+        websiteIssue: l.websiteIssue || '',
         status:  'Valid',
       })));
 
@@ -1232,6 +1333,9 @@ module.exports = {
   releaseLeadFinderLock,
   collectForNiche,
   GERMANY_CITIES,
+  USA_CITIES,
+  citiesForCountry,
+  detectWebsiteIssue,
   getTomTomMaxCalls,
   // ── Shared helpers used by smartSearchService ───────────────────────────
   searchTomTom,

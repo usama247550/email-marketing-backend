@@ -64,4 +64,15 @@ check('replace leaves an unknown tag untouched so send can be blocked', () => {
   );
 });
 
+check('replace fills websiteIssue and uses a safe line when it is empty', () => {
+  assert.equal(
+    replaceTemplateVariables('I noticed {{websiteIssue}}.', { websiteIssue: 'your site is difficult to use on a phone' }, {}),
+    'I noticed your site is difficult to use on a phone.'
+  );
+  assert.match(
+    replaceTemplateVariables('{{websiteIssue}}', {}, {}),
+    /local customers/
+  );
+});
+
 console.log(`\n${checks} template variable checks passed.`);
