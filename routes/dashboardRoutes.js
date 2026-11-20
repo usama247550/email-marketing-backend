@@ -37,11 +37,11 @@ router.get('/stats', async (req, res) => {
 
     // ── Campaign / sending counts ────────────────────────────────────────────
     const campaignFilter = byProject ? { projectId: project } : {};
-    const campaigns = await Campaign.find(campaignFilter, '_id sentCount openedCount');
+    const campaigns = await Campaign.find(campaignFilter, '_id sentCount openedCount unsubscribedCount');
 
     const emailsSent = campaigns.reduce((sum, c) => sum + (c.sentCount || 0), 0);
     const emailsOpened = campaigns.reduce((sum, c) => sum + (c.openedCount || 0), 0);
-    const replies = 0; // reply tracking not implemented yet
+    const unsubscribed = campaigns.reduce((sum, c) => sum + (c.unsubscribedCount || 0), 0);
 
     // ── Recent campaigns ─────────────────────────────────────────────────────
     const recentCampaigns = await Campaign.find(campaignFilter)
@@ -52,7 +52,7 @@ router.get('/stats', async (req, res) => {
     res.json({
       success: true,
       data: {
-        stats: { totalLeads, emailsFound, emailsSent, emailsOpened, replies },
+        stats: { totalLeads, emailsFound, emailsSent, emailsOpened, unsubscribed },
         recentCampaigns
       }
     });
