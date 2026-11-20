@@ -21,6 +21,7 @@ const Project     = require('../models/Project');
 const Template    = require('../models/Template');
 const emailSender = require('./emailSender');
 const leadFinderService = require('./leadFinderService');
+const { assertTemplateVariables } = require('./templateVariables');
 
 /**
  * Run a single automation by ID.
@@ -78,6 +79,20 @@ const runAutomation = async (automationId) => {
     }
 
     const template = await Template.findById(automation.templateId);
+    if (template) {
+      try {
+        assertTemplateVariables(template.subject, template.body);
+      } catch (variableErr) {
+        if (variableErr.code !== 'UNKNOWN_TEMPLATE_VARIABLES') throw variableErr;
+        console.warn(`[AutomationEngine] "${automation.name}": ${variableErr.message}`);
+        automation.lastRunSentCount = 0;
+        automation.lastRunFinderStatus = 'failed';
+        automation.lastRunFinderMessage = variableErr.message;
+        await automation.save();
+        return { sentCount: 0, skipped: true };
+      }
+    }
+
     if (!template) {
       const msg = 'Template was deleted — automation paused automatically';
       console.warn(`[AutomationEngine] Automation "${automation.name}" (${automationId}): ${msg}`);

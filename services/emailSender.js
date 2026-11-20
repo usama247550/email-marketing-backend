@@ -23,22 +23,16 @@ const axios      = require('axios');
 
 const EmailLog = require('../models/EmailLog');
 const Campaign = require('../models/Campaign');
+const {
+  assertTemplateVariables,
+  replaceTemplateVariables,
+} = require('./templateVariables');
 
 // ─── Small utilities ──────────────────────────────────────────────────────────
 
 const generateTrackingToken = () => crypto.randomBytes(32).toString('hex');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const replaceTemplateVariables = (text, lead) =>
-  text
-    .replace(/\{\{companyName\}\}/g, lead.company   || '[Company]')
-    .replace(/\{\{company\}\}/g,     lead.company   || '[Company]')
-    .replace(/\{\{firstName\}\}/g,   lead.firstName || '[Name]')
-    .replace(/\{\{name\}\}/g,        lead.firstName || '[Name]')
-    .replace(/\{\{email\}\}/g,       lead.email     || '[Email]')
-    .replace(/\{\{city\}\}/g,        lead.city      || '[City]')
-    .replace(/\{\{website\}\}/g,     lead.website   || '[Website]');
 
 // ─── Low-level send helpers ───────────────────────────────────────────────────
 
@@ -142,6 +136,9 @@ const sendEmailsToLeads = async ({
   campaign,
   onLeadSent = null,
 }) => {
+  // Stop before Brevo sees a tag we do not fill (for example {{contact.COMPANY}}).
+  assertTemplateVariables(template.subject, template.body);
+
   const { sendingMethod, emailApiAccount, transporter } = await setupTransport(project);
 
   const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || 'http://localhost:5000';
@@ -159,8 +156,8 @@ const sendEmailsToLeads = async ({
       }
 
       // ── Personalise content ───────────────────────────────────────────────
-      const personalizedSubject = replaceTemplateVariables(template.subject, lead);
-      const personalizedBody    = replaceTemplateVariables(template.body,    lead);
+      const personalizedSubject = replaceTemplateVariables(template.subject, lead, project);
+      const personalizedBody    = replaceTemplateVariables(template.body, lead, project);
 
       const trackingPixel   = `<img src="${PUBLIC_BACKEND_URL}/api/track/open/${trackingId}" width="1" height="1" style="display:none;" alt="" />`;
       const unsubscribeLink = `<br><br><small><a href="${PUBLIC_BACKEND_URL}/api/track/unsubscribe/${trackingId}">Unsubscribe</a></small>`;

@@ -4,6 +4,7 @@ const Project       = require('../models/Project');
 const Template      = require('../models/Template');
 const Lead          = require('../models/Lead');
 const { setupTransport, sendEmailsToLeads } = require('../services/emailSender');
+const { assertTemplateVariables } = require('../services/templateVariables');
 
 // ─── Create campaign and trigger email sending ────────────────────────────────
 
@@ -38,6 +39,15 @@ exports.createCampaign = async (req, res) => {
     const template = await Template.findById(templateId);
     if (!template) {
       return res.status(404).json({ success: false, message: 'Template not found' });
+    }
+
+    try {
+      assertTemplateVariables(template.subject, template.body);
+    } catch (variableErr) {
+      if (variableErr.code === 'UNKNOWN_TEMPLATE_VARIABLES') {
+        return res.status(400).json({ success: false, message: variableErr.message });
+      }
+      throw variableErr;
     }
 
     // All valid leads from the selected batches

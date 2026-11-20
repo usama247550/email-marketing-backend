@@ -1,5 +1,21 @@
 const Template   = require('../models/Template');
 const Automation = require('../models/Automation');
+const { assertTemplateVariables } = require('../services/templateVariables');
+
+function rejectUnknownTemplateVariables(subject, body, res) {
+  try {
+    assertTemplateVariables(subject, body);
+    return false;
+  } catch (error) {
+    if (error.code !== 'UNKNOWN_TEMPLATE_VARIABLES') throw error;
+    res.status(400).json({
+      success: false,
+      message: error.message,
+      unknown: error.unknown,
+    });
+    return true;
+  }
+}
 
 // @desc    Get all templates
 // @route   GET /api/templates
@@ -61,6 +77,8 @@ const getTemplateById = async (req, res) => {
 // @access  Public
 const createTemplate = async (req, res) => {
   try {
+    if (rejectUnknownTemplateVariables(req.body.subject, req.body.body, res)) return;
+
     const template = await Template.create(req.body);
 
     res.status(201).json({
@@ -91,6 +109,18 @@ const createTemplate = async (req, res) => {
 // @access  Public
 const updateTemplate = async (req, res) => {
   try {
+    const existing = await Template.findById(req.params.id);
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: 'Template not found'
+      });
+    }
+
+    const subject = req.body.subject !== undefined ? req.body.subject : existing.subject;
+    const body = req.body.body !== undefined ? req.body.body : existing.body;
+    if (rejectUnknownTemplateVariables(subject, body, res)) return;
+
     const template = await Template.findByIdAndUpdate(
       req.params.id,
       req.body,

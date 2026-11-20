@@ -5,6 +5,7 @@ const Campaign = require('../models/Campaign');
 const Lead = require('../models/Lead');
 const Template = require('../models/Template');
 const Project = require('../models/Project');
+const { replaceTemplateVariables } = require('../services/templateVariables');
 
 // GET /api/debug/latest-email - Get the most recent email with full HTML content
 router.get('/latest-email', async (req, res) => {
@@ -28,20 +29,8 @@ router.get('/latest-email', async (req, res) => {
     const template = campaign.templateId;
     const project = campaign.projectId;
 
-    // Helper function to replace template variables (copied from campaignController)
-    const replaceTemplateVariables = (text, lead) => {
-      return text
-        .replace(/\{\{companyName\}\}/g, lead.company || '[Company]')
-        .replace(/\{\{company\}\}/g, lead.company || '[Company]')
-        .replace(/\{\{firstName\}\}/g, lead.firstName || '[Name]')
-        .replace(/\{\{name\}\}/g, lead.firstName || '[Name]')
-        .replace(/\{\{email\}\}/g, lead.email || '[Email]')
-        .replace(/\{\{city\}\}/g, lead.city || '[City]')
-        .replace(/\{\{website\}\}/g, lead.website || '[Website]');
-    };
-
-    const personalizedSubject = replaceTemplateVariables(template.subject, lead);
-    const personalizedBody = replaceTemplateVariables(template.body, lead);
+    const personalizedSubject = replaceTemplateVariables(template.subject, lead, project);
+    const personalizedBody = replaceTemplateVariables(template.body, lead, project);
 
     // Add tracking pixel and unsubscribe link (copied from campaignController)
     const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || 'http://localhost:5000';
