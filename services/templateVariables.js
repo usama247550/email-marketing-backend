@@ -6,7 +6,8 @@
  * Brevo replaces it with a blank and the email still goes out.
  *
  * Allowed names (case-sensitive, same as the Templates page buttons):
- *   companyName, company, firstName, name, email, city, website, senderName, websiteIssue
+ *   companyName, company, firstName, name, email, city, website, senderName,
+ *   websiteIssue (EN fallback), websiteIssueDe (DE fallback when empty)
  */
 
 'use strict';
@@ -21,12 +22,49 @@ const ALLOWED_VARIABLES = new Set([
   'website',
   'senderName',
   'websiteIssue',
+  'websiteIssueDe',
 ]);
 
 const TAG_PATTERN = /\{\{\s*([^{}]+?)\s*\}\}/g;
 
 const ALLOWED_LIST_TEXT =
-  '{{companyName}}, {{firstName}}, {{city}}, {{website}}, {{email}}, {{senderName}}, {{websiteIssue}}';
+  '{{companyName}}, {{firstName}}, {{city}}, {{website}}, {{email}}, {{senderName}}, {{websiteIssue}}, {{websiteIssueDe}}';
+
+const DEFAULT_WEBSITE_ISSUE = 'your website could bring in more local customers';
+const DEFAULT_WEBSITE_ISSUE_DE =
+  'Ihre Website könnte Ihnen mehr Anfragen aus der Region bringen';
+
+/**
+ * Rich-text editors sometimes split {{websiteIssue}} with <span> etc. Brevo blanks
+ * any {{tag}} we fail to replace. Merge tag text back to plain {{name}} first.
+ */
+function normalizeMergeTagsInHtml(text) {
+  if (!text || typeof text !== 'string') return text || '';
+  let normalized = text
+    .replace(/\uFF5B/g, '{')
+    .replace(/\uFF5D/g, '}');
+
+  return normalized.replace(/\{\{([\s\S]*?)\}\}/g, (full, inner) => {
+    const name = inner
+      .replace(/<[^>]*>/g, '')
+      .replace(/&nbsp;/gi, ' ')
+      .trim()
+      .replace(/\s+/g, '');
+    if (ALLOWED_VARIABLES.has(name)) return `{{${name}}}`;
+    for (const allowed of ALLOWED_VARIABLES) {
+      if (name.toLowerCase() === allowed.toLowerCase()) return `{{${allowed}}}`;
+    }
+    return full;
+  });
+}
+
+function resolveWebsiteIssue(lead, fallback = DEFAULT_WEBSITE_ISSUE) {
+  if (!lead) return fallback;
+  const raw = typeof lead.get === 'function' ? lead.get('websiteIssue') : lead.websiteIssue;
+  if (raw == null) return fallback;
+  const trimmed = String(raw).trim();
+  return trimmed || fallback;
+}
 
 function findTemplateTags(text) {
   if (!text) return [];
@@ -42,7 +80,9 @@ function findTemplateTags(text) {
 function findUnknownVariables(subject, body) {
   const seen = new Set();
   const unknown = [];
-  for (const name of [...findTemplateTags(subject), ...findTemplateTags(body)]) {
+  const subj = normalizeMergeTagsInHtml(subject);
+  const bod = normalizeMergeTagsInHtml(body);
+  for (const name of [...findTemplateTags(subj), ...findTemplateTags(bod)]) {
     if (ALLOWED_VARIABLES.has(name) || seen.has(name)) continue;
     seen.add(name);
     unknown.push(name);
@@ -72,11 +112,12 @@ function assertTemplateVariables(subject, body) {
 
 function replaceTemplateVariables(text, lead = {}, project = {}) {
   if (!text) return text || '';
+  const html = normalizeMergeTagsInHtml(text);
   const company = lead.company || '[Company]';
   const firstName = lead.firstName || '[Name]';
   const sender = (project && (project.senderName || project.senderEmail)) || '[Sender]';
 
-  return text
+  return html
     .replace(/\{\{\s*companyName\s*\}\}/g, company)
     .replace(/\{\{\s*company\s*\}\}/g, company)
     .replace(/\{\{\s*firstName\s*\}\}/g, firstName)
@@ -85,11 +126,16 @@ function replaceTemplateVariables(text, lead = {}, project = {}) {
     .replace(/\{\{\s*city\s*\}\}/g, lead.city || '[City]')
     .replace(/\{\{\s*website\s*\}\}/g, lead.website || '[Website]')
     .replace(/\{\{\s*senderName\s*\}\}/g, sender)
-    .replace(/\{\{\s*websiteIssue\s*\}\}/g, lead.websiteIssue || 'your website could bring in more local customers');
+    .replace(/\{\{\s*websiteIssue\s*\}\}/gi, resolveWebsiteIssue(lead, DEFAULT_WEBSITE_ISSUE))
+    .replace(/\{\{\s*websiteIssueDe\s*\}\}/gi, resolveWebsiteIssue(lead, DEFAULT_WEBSITE_ISSUE_DE));
 }
 
 module.exports = {
   ALLOWED_VARIABLES,
+  DEFAULT_WEBSITE_ISSUE,
+  DEFAULT_WEBSITE_ISSUE_DE,
+  normalizeMergeTagsInHtml,
+  resolveWebsiteIssue,
   findUnknownVariables,
   unknownVariableMessage,
   assertTemplateVariables,

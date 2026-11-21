@@ -6,6 +6,9 @@ const {
   findUnknownVariables,
   replaceTemplateVariables,
   assertTemplateVariables,
+  normalizeMergeTagsInHtml,
+  DEFAULT_WEBSITE_ISSUE,
+  DEFAULT_WEBSITE_ISSUE_DE,
 } = require('../services/templateVariables');
 
 let checks = 0;
@@ -64,14 +67,31 @@ check('replace leaves an unknown tag untouched so send can be blocked', () => {
   );
 });
 
+check('broken HTML inside websiteIssue still gets the fallback for CSV leads', () => {
+  const broken = '<p>I noticed {{web<span>siteIssue</span>}}.</p>';
+  const fixed = normalizeMergeTagsInHtml(broken);
+  assert.match(fixed, /\{\{websiteIssue\}\}/);
+  const out = replaceTemplateVariables(broken, { company: 'Acme' }, {});
+  assert.match(out, /local customers/);
+  assert.doesNotMatch(out, /\{\{/);
+});
+
 check('replace fills websiteIssue and uses a safe line when it is empty', () => {
   assert.equal(
     replaceTemplateVariables('I noticed {{websiteIssue}}.', { websiteIssue: 'your site is difficult to use on a phone' }, {}),
     'I noticed your site is difficult to use on a phone.'
   );
-  assert.match(
-    replaceTemplateVariables('{{websiteIssue}}', {}, {}),
-    /local customers/
+  assert.equal(replaceTemplateVariables('{{websiteIssue}}', {}, {}), DEFAULT_WEBSITE_ISSUE);
+});
+
+check('German tag uses German fallback when lead has no websiteIssue', () => {
+  assert.equal(
+    replaceTemplateVariables('{{websiteIssueDe}}', {}, {}),
+    DEFAULT_WEBSITE_ISSUE_DE
+  );
+  assert.equal(
+    replaceTemplateVariables('{{websiteIssueDe}}', { websiteIssue: 'your site is difficult to use on a phone' }, {}),
+    'your site is difficult to use on a phone'
   );
 });
 
