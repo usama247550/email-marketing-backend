@@ -52,15 +52,17 @@ exports.createCampaign = async (req, res) => {
 
     // All valid leads from the selected batches
     const validLeads = await Lead.find({
-      batchId: { $in: batchIds },
-      status:  'Valid',
-      email:   { $exists: true, $ne: '' },
+      batchId:        { $in: batchIds },
+      status:         'Valid',
+      emailVerified:  true,
+      email:          { $exists: true, $ne: '' },
     });
 
     if (validLeads.length === 0) {
       return res.status(400).json({
         success: false,
-        message: 'No valid leads found in selected batches',
+        message:
+          'No verified leads in these batches. Open Leads, select the batch, and click Verify emails — only verified addresses are sent (helps avoid Brevo blocks).',
       });
     }
 

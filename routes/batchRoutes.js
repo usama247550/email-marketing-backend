@@ -5,6 +5,7 @@ const {
   getBatchById,
   deleteBatch,
   importCsv,
+  verifyBatchEmails,
   upload
 } = require('../controllers/batchController');
 
@@ -19,5 +20,8 @@ router.delete('/:id', deleteBatch);
 
 // POST /api/batches/import-csv - Import CSV file
 router.post('/import-csv', upload.single('csvFile'), importCsv);
+
+// POST /api/batches/:id/verify-emails - MX / domain checks (no paid API)
+router.post('/:id/verify-emails', verifyBatchEmails);
 
 module.exports = router;

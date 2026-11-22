@@ -1,5 +1,9 @@
 const Lead = require('../models/Lead');
 const Batch = require('../models/Batch');
+const { verifyEmailAddress } = require('../services/emailVerification');
+const { syncBatchLeadCount, purgeUnverifiedLeads } = require('../services/verifyBatchLeads');
+
+const EMAIL_SYNTAX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // Get leads by batch ID with pagination
 const getLeadsByBatch = async (req, res) => {
@@ -15,14 +19,17 @@ const getLeadsByBatch = async (req, res) => {
       return res.status(404).json({ error: 'Batch not found' });
     }
 
-    // Get leads for the batch
-    const leads = await Lead.find({ batchId })
+    await purgeUnverifiedLeads(batchId);
+
+    const listFilter = { batchId, emailVerified: true };
+
+    const leads = await Lead.find(listFilter)
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
       .populate('batchId', 'name source');
 
-    const total = await Lead.countDocuments({ batchId });
+    const total = await Lead.countDocuments(listFilter);
     const totalPages = Math.ceil(total / limit);
 
     res.json({
@@ -43,6 +50,64 @@ const getLeadsByBatch = async (req, res) => {
   }
 };
 
+const updateLead = async (req, res) => {
+  try {
+    const leadId = req.params.id;
+    const lead = await Lead.findById(leadId);
+    if (!lead) {
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    const { company, city, website, email } = req.body || {};
+
+    if (company !== undefined) lead.company = String(company).trim();
+    if (city !== undefined) lead.city = String(city).trim();
+    if (website !== undefined) lead.website = String(website).trim();
+    if (email !== undefined) {
+      const normalized = String(email).trim().toLowerCase();
+      if (normalized && !EMAIL_SYNTAX.test(normalized)) {
+        return res.status(400).json({ error: 'Invalid email address' });
+      }
+      lead.email = normalized;
+    }
+
+    if (lead.status !== 'Unsubscribed') {
+      if (!lead.email) {
+        await Lead.findByIdAndDelete(lead._id);
+        await syncBatchLeadCount(lead.batchId);
+        return res.json({
+          message: 'Lead removed — email is required',
+          removed: true,
+        });
+      }
+      const result = await verifyEmailAddress(lead.email, lead.website);
+      if (!result.verified) {
+        const batchId = lead.batchId;
+        await Lead.findByIdAndDelete(lead._id);
+        await syncBatchLeadCount(batchId);
+        return res.json({
+          message: `Lead removed — ${result.reason}`,
+          removed: true,
+        });
+      }
+      lead.emailVerified = true;
+      lead.emailVerifyNote = result.reason;
+      lead.status = 'Valid';
+    }
+
+    await lead.save();
+    await syncBatchLeadCount(lead.batchId);
+
+    res.json({
+      message: 'Lead updated successfully',
+      lead,
+    });
+  } catch (error) {
+    console.error('Error updating lead:', error);
+    res.status(500).json({ error: 'Failed to update lead' });
+  }
+};
+
 // Delete a single lead by ID
 const deleteLead = async (req, res) => {
   try {
@@ -56,12 +121,7 @@ const deleteLead = async (req, res) => {
     // Delete the lead
     await Lead.findByIdAndDelete(leadId);
 
-    // Update batch lead count
-    const batch = await Batch.findById(lead.batchId);
-    if (batch) {
-      batch.leadCount = Math.max(0, batch.leadCount - 1);
-      await batch.save();
-    }
+    await syncBatchLeadCount(lead.batchId);
 
     res.json({
       message: 'Lead deleted successfully',
@@ -75,5 +135,6 @@ const deleteLead = async (req, res) => {
 
 module.exports = {
   getLeadsByBatch,
-  deleteLead
+  updateLead,
+  deleteLead,
 };

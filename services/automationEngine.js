@@ -186,6 +186,7 @@ const runAutomation = async (automationId) => {
     const leads = await Lead.find({
       batchId:            { $in: batchIds },
       status:             'Valid',
+      emailVerified:      true,
       email:              { $exists: true, $ne: '' },
       emailedTemplateIds: { $nin: [automation.templateId] },
     })

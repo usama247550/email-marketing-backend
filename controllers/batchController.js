@@ -1,5 +1,7 @@
 const Batch = require('../models/Batch');
 const Lead = require('../models/Lead');
+const { verifyEmailAddress } = require('../services/emailVerification');
+const { verifyBatchLeads, syncBatchLeadCount } = require('../services/verifyBatchLeads');
 const multer = require('multer');
 const { parse } = require('csv-parse');
 const fs = require('fs');
@@ -73,11 +75,32 @@ const getAllBatches = async (req, res) => {
       .skip(skip)
       .limit(limit);
 
+    const batchIds = batches.map((b) => b._id);
+    let sendableByBatch = new Map();
+    if (batchIds.length > 0) {
+      const counts = await Lead.aggregate([
+        {
+          $match: {
+            batchId: { $in: batchIds },
+            status: 'Valid',
+            emailVerified: true,
+          },
+        },
+        { $group: { _id: '$batchId', sendableLeadCount: { $sum: 1 } } },
+      ]);
+      sendableByBatch = new Map(counts.map((row) => [String(row._id), row.sendableLeadCount]));
+    }
+
+    const batchesWithCounts = batches.map((b) => ({
+      ...b.toObject(),
+      sendableLeadCount: sendableByBatch.get(String(b._id)) || 0,
+    }));
+
     const total = await Batch.countDocuments(filter);
     const totalPages = Math.ceil(total / limit);
 
     res.json({
-      batches,
+      batches: batchesWithCounts,
       pagination: {
         currentPage: page,
         totalPages,
@@ -174,52 +197,61 @@ const importCsv = async (req, res) => {
       }
 
       try {
-        // Process each row
+        let rowsSkipped = 0;
         for (const record of records) {
           const normalizedRecord = {};
-          
-          // Normalize column names
           Object.keys(record).forEach(key => {
             const normalizedKey = normalizeColumnName(key);
             normalizedRecord[normalizedKey] = record[key];
           });
 
-          // Create lead with normalized data
-          const leadData = {
+          const email = String(normalizedRecord.email || '').trim().toLowerCase();
+          if (!email || !isValidEmail(email)) {
+            rowsSkipped += 1;
+            continue;
+          }
+
+          const website = String(normalizedRecord.website || '').trim();
+          const check = await verifyEmailAddress(email, website);
+          if (!check.verified) {
+            rowsSkipped += 1;
+            continue;
+          }
+
+          leads.push({
             batchId: batch._id,
             company: normalizedRecord.company || '',
             city: normalizedRecord.city || '',
-            website: normalizedRecord.website || '',
-            email: normalizedRecord.email || '',
-            status: 'Invalid'
-          };
-
-          // Validate email if present
-          if (leadData.email && isValidEmail(leadData.email)) {
-            leadData.status = 'Valid';
-          }
-
-          leads.push(leadData);
+            website,
+            email,
+            status: 'Valid',
+            emailVerified: true,
+            emailVerifyNote: check.reason,
+          });
         }
 
-        // Save all leads to database
+        let verifyStats = { verified: 0, removed: 0, total: 0 };
         if (leads.length > 0) {
           await Lead.insertMany(leads);
-          
-          // Update batch lead count
-          batch.leadCount = leads.length;
-          await batch.save();
+          verifyStats = await verifyBatchLeads(batch._id);
+        } else {
+          await Batch.findByIdAndDelete(batch._id);
+          fs.unlinkSync(filePath);
+          return res.status(400).json({
+            error: 'No verified leads in this CSV. Rows were skipped (bad email, no MX, or domain mismatch).',
+            rowsSkipped,
+          });
         }
 
         // Clean up uploaded file
         fs.unlinkSync(filePath);
 
+        const freshBatch = await Batch.findById(batch._id);
         res.json({
           message: 'CSV imported successfully',
-          batch,
-          leadsImported: leads.length,
-          validLeads: leads.filter(lead => lead.status === 'Valid').length,
-          invalidLeads: leads.filter(lead => lead.status === 'Invalid').length
+          batch: freshBatch,
+          leadsImported: freshBatch?.leadCount ?? leads.length,
+          rowsSkipped,
         });
 
       } catch (dbError) {
@@ -241,10 +273,30 @@ const importCsv = async (req, res) => {
   }
 };
 
+const verifyBatchEmails = async (req, res) => {
+  try {
+    const batch = await Batch.findById(req.params.id);
+    if (!batch) {
+      return res.status(404).json({ error: 'Batch not found' });
+    }
+    const stats = await verifyBatchLeads(batch._id);
+    res.json({
+      message: 'Email verification finished',
+      batchId: batch._id,
+      ...stats,
+      sendableLeadCount: stats.verified,
+    });
+  } catch (error) {
+    console.error('Error verifying batch emails:', error);
+    res.status(500).json({ error: 'Failed to verify emails for this batch' });
+  }
+};
+
 module.exports = {
   getAllBatches,
   getBatchById,
   deleteBatch,
   importCsv,
+  verifyBatchEmails,
   upload
 };

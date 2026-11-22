@@ -22,6 +22,8 @@ const { runMultiNicheSearch, isLeadFinderActive } = require('../services/leadFin
 const { runSmartSearch }      = require('../services/smartSearchService');
 const Batch                   = require('../models/Batch');
 const Lead                    = require('../models/Lead');
+const { verifyEmailAddress }  = require('../services/emailVerification');
+const { syncBatchLeadCount }  = require('../services/verifyBatchLeads');
 
 // ── In-memory job store ───────────────────────────────────────────────────────
 
@@ -346,29 +348,46 @@ const saveSmartSearchResults = async (req, res) => {
   const dateStr = new Date().toISOString().slice(0, 10);
   const batchName = `Smart: ${pp.niche || 'search'} - ${loc} - ${dateStr}`;
 
+  const verifiedRows = [];
+  for (const l of leadsToSave) {
+    const check = await verifyEmailAddress(l.email, l.website || '');
+    if (!check.verified) continue;
+    verifiedRows.push({
+      company: l.company,
+      city: l.city || pp.city || pp.country || '',
+      website: l.website || '',
+      email: String(l.email).toLowerCase().trim(),
+      niche: l.niche || pp.niche || '',
+      matchReason: l._fromRejected ? `Manually added: ${l.reason || ''}` : (l.reason || ''),
+      status: 'Valid',
+      emailVerified: true,
+      emailVerifyNote: check.reason,
+    });
+  }
+
+  if (verifiedRows.length === 0) {
+    return res.status(400).json({ error: 'No verified leads to save (all failed email checks).' });
+  }
+
   try {
     const batch = new Batch({
       name: batchName, projectId: job.params.projectId,
-      source: 'Lead Finder Agent', leadCount: leadsToSave.length,
+      source: 'Lead Finder Agent', leadCount: 0,
     });
     await batch.save();
 
-    await Lead.insertMany(leadsToSave.map(l => ({
-      batchId:     batch._id,
-      company:     l.company,
-      city:        l.city || pp.city || pp.country || '',
-      website:     l.website || '',
-      email:       l.email,
-      niche:       l.niche || pp.niche || '',
-      matchReason: l._fromRejected ? `Manually added: ${l.reason || ''}` : (l.reason || ''),
-      status:      'Valid',
-    })));
+    for (const row of verifiedRows) {
+      row.batchId = batch._id;
+    }
+
+    await Lead.insertMany(verifiedRows);
+    await syncBatchLeadCount(batch._id);
 
     job.saved = true;
-    console.log(`[SmartSearch] Saved ${leadsToSave.length} leads to batch "${batchName}" (${batch._id})`);
+    console.log(`[SmartSearch] Saved ${verifiedRows.length} verified leads to batch "${batchName}" (${batch._id})`);
 
     return res.json({
-      success: true, batchId: batch._id, batchName, savedCount: leadsToSave.length,
+      success: true, batchId: batch._id, batchName, savedCount: verifiedRows.length,
     });
   } catch (err) {
     console.error('[SmartSearch] Save error:', err.message);

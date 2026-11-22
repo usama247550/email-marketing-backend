@@ -30,6 +30,8 @@ const cheerio        = require('cheerio');
 const Batch          = require('../models/Batch');
 const Lead           = require('../models/Lead');
 const { resolveNicheTerms } = require('./nicheResolver');
+const { rankEmailsByWebsite, verifyEmailAddress } = require('./emailVerification');
+const { verifyBatchLeads, syncBatchLeadCount } = require('./verifyBatchLeads');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -398,7 +400,7 @@ async function scrapeEmailForSite(rawUrl, fetchErrorCounts, country = '') {
     return null;
   }
 
-  const homeEmails = extractEmailsFromHtml(homeFetch.html);
+  const homeEmails = rankEmailsByWebsite(extractEmailsFromHtml(homeFetch.html), rawUrl);
   const websiteIssue = detectWebsiteIssue(homeFetch.html, homeFetch.finalUrl);
   if (homeEmails.length > 0) return { email: homeEmails[0], websiteIssue };
 
@@ -441,7 +443,7 @@ async function scrapeEmailForSite(rawUrl, fetchErrorCounts, country = '') {
       }
       continue;
     }
-    const emails = extractEmailsFromHtml(page.html);
+    const emails = rankEmailsByWebsite(extractEmailsFromHtml(page.html), rawUrl);
     if (emails.length > 0) return { email: emails[0], websiteIssue };
   }
 
@@ -1159,12 +1161,16 @@ const runMultiNicheSearch = async ({
         // Stop immediately if target is reached — ignore further results in flight
         if (totalSaved + roundLeads.length >= totalLeads) break;
 
+        const check = await verifyEmailAddress(norm, r.biz.website || '');
+        if (!check.verified) continue;
+
         seenEmails.add(norm);
         roundLeads.push({
           biz: r.biz,
           email: norm,
           niche: r.biz._niche || niches[0],
           websiteIssue: r.websiteIssue || GENERIC_WEBSITE_ISSUE,
+          emailVerifyNote: check.reason,
         });
         roundValid++;
       }
@@ -1219,6 +1225,8 @@ const runMultiNicheSearch = async ({
         niche:   l.niche,
         websiteIssue: l.websiteIssue || '',
         status:  'Valid',
+        emailVerified: true,
+        emailVerifyNote: l.emailVerifyNote || 'OK',
       })));
 
       // Update niche saved counts
@@ -1229,8 +1237,7 @@ const runMultiNicheSearch = async ({
 
       totalSaved += leadsToSave.length;
 
-      // Update batch leadCount
-      await BatchModel.updateOne({ _id: batchId }, { leadCount: totalSaved });
+      await syncBatchLeadCount(batchId);
       console.log(`[LeadFinder] Round ${roundNum}: saved ${leadsToSave.length} leads (total=${totalSaved})`);
     }
 
@@ -1317,8 +1324,24 @@ const runMultiNicheSearch = async ({
     })),
   };
 
+  let emailVerifyStats = { verified: totalSaved, removed: 0, total: totalSaved };
+  if (batchId && totalSaved > 0) {
+    try {
+      emailVerifyStats = await verifyBatchLeads(batchId);
+      console.log(
+        `[LeadFinder] Verified list: ${emailVerifyStats.verified} kept, ` +
+        `${emailVerifyStats.removed} removed`
+      );
+    } catch (verifyErr) {
+      console.warn('[LeadFinder] Email cleanup pass failed:', verifyErr.message);
+    }
+  }
+
   console.log(`[LeadFinder] ── Pipeline complete in ${totalElapsed}s ─────────────────`);
   console.log(`[LeadFinder] stopReason=${stopReason} | saved=${totalSaved}/${totalLeads} | rounds=${allRoundStats.length} | TomTom=${tomtomCallCounter.count}`);
+
+  summary.emailVerifyStats = emailVerifyStats;
+  summary.sendableCount = emailVerifyStats.verified;
 
   return summary;
   } finally {

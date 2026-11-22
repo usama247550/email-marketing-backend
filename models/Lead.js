@@ -41,6 +41,15 @@ const leadSchema = new mongoose.Schema({
     trim: true,
     default: ''
   },
+  emailVerified: {
+    type: Boolean,
+    default: false,
+  },
+  emailVerifyNote: {
+    type: String,
+    trim: true,
+    default: '',
+  },
   // Why the AI decided this lead matches the search criteria (Smart Search only)
   matchReason: {
     type: String,
@@ -64,6 +73,7 @@ const leadSchema = new mongoose.Schema({
 // MongoDB can use this index to quickly filter valid leads and then apply
 // the $nin check on the small emailedTemplateIds array per document.
 leadSchema.index({ status: 1, batchId: 1 });
+leadSchema.index({ batchId: 1, emailVerified: 1, status: 1 });
 
 // Index for fast email-scoped-to-project deduplication in the Lead Finder.
 // Usage: Lead.find({ batchId: { $in: projectBatchIds }, email: '...' })
