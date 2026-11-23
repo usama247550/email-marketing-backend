@@ -27,6 +27,8 @@ const emailApiAccountRoutes = require('./routes/emailApiAccountRoutes');
 const brevoWebhookRoutes = require('./routes/brevoWebhookRoutes');
 const automationRoutes   = require('./routes/automationRoutes');
 const leadFinderRoutes   = require('./routes/leadFinderRoutes');
+const authRoutes         = require('./routes/authRoutes');
+const { requireAuth }    = require('./middleware/requireAuth');
 const { startScheduler } = require('./services/scheduler');
 
 // Connect to MongoDB, then start the automation scheduler
@@ -74,6 +76,10 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json());
+
+// Auth (login is public; other /api routes require Bearer token)
+app.use('/api/auth', authRoutes);
+app.use('/api', requireAuth);
 
 // Routes
 app.use('/api/projects', projectRoutes);
