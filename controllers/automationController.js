@@ -1,4 +1,5 @@
 const Automation = require('../models/Automation');
+const { parseSendSchedule } = require('../services/sendSchedule');
 
 // ─── GET /api/automations ─────────────────────────────────────────────────────
 
@@ -116,6 +117,8 @@ exports.createAutomation = async (req, res) => {
       effectiveFinder = finder;
     }
 
+    const schedule = parseSendSchedule(req.body);
+
     const automation = new Automation({
       name: name.trim(),
       projectId,
@@ -124,6 +127,9 @@ exports.createAutomation = async (req, res) => {
       scheduledTime,
       status: status || 'active',
       leadSource: effectiveLeadSource,
+      emailGapSeconds: schedule.emailGapSeconds,
+      partCount: schedule.partCount,
+      partGapMinutes: schedule.partGapMinutes,
       ...(effectiveFinder ? { finder: effectiveFinder } : {}),
     });
 
@@ -152,7 +158,7 @@ exports.updateAutomation = async (req, res) => {
 
     const allowed = [
       'name', 'projectId', 'templateId', 'dailyLimit', 'scheduledTime', 'status',
-      'leadSource', 'finder',
+      'leadSource', 'finder', 'emailGapSeconds', 'partCount', 'partGapMinutes',
     ];
 
     const targetLeadSource = req.body.leadSource !== undefined ? req.body.leadSource : automation.leadSource;

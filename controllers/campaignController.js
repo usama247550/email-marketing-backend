@@ -5,6 +5,51 @@ const Template      = require('../models/Template');
 const Lead          = require('../models/Lead');
 const { setupTransport, sendEmailsToLeads } = require('../services/emailSender');
 const { assertTemplateVariables } = require('../services/templateVariables');
+const { parseSendSchedule, estimateSendDurationMs } = require('../services/sendSchedule');
+
+async function runCampaignSendInBackground(campaignId) {
+  try {
+    const campaign = await Campaign.findById(campaignId);
+    if (!campaign || campaign.status !== 'sending') return;
+
+    const project = await Project.findById(campaign.projectId).populate('emailApiAccountId');
+    const template = await Template.findById(campaign.templateId);
+    if (!project || !template) {
+      campaign.status = 'failed';
+      await campaign.save();
+      return;
+    }
+
+    const validLeads = await Lead.find({
+      batchId:       { $in: campaign.batchIds },
+      status:        'Valid',
+      emailVerified: true,
+      email:         { $exists: true, $ne: '' },
+    });
+
+    if (validLeads.length === 0) {
+      campaign.status = 'failed';
+      await campaign.save();
+      return;
+    }
+
+    const { sentCount } = await sendEmailsToLeads({
+      project,
+      template,
+      leads:    validLeads,
+      campaign,
+    });
+
+    campaign.status = sentCount > 0 ? 'completed' : 'failed';
+    campaign.sentAt = new Date();
+    await campaign.save();
+  } catch (error) {
+    console.error(`[campaign] Background send failed for ${campaignId}:`, error);
+    try {
+      await Campaign.findByIdAndUpdate(campaignId, { status: 'failed' });
+    } catch (_) { /* ignore */ }
+  }
+}
 
 // ─── Create campaign and trigger email sending ────────────────────────────────
 
@@ -66,40 +111,44 @@ exports.createCampaign = async (req, res) => {
       });
     }
 
-    // Create campaign record
+    const schedule = parseSendSchedule(req.body);
+
     const campaign = new Campaign({
       name,
       projectId,
       templateId,
       batchIds,
       totalRecipients: validLeads.length,
-      status: 'sending',
+      status:          'sending',
+      emailGapSeconds:   schedule.emailGapSeconds,
+      partCount:         schedule.partCount,
+      partGapMinutes:    schedule.partGapMinutes,
     });
     await campaign.save();
 
-    // Delegate per-lead sending to the shared service
-    const { sentCount } = await sendEmailsToLeads({
-      project,
-      template,
-      leads:    validLeads,
-      campaign,
+    setImmediate(() => {
+      runCampaignSendInBackground(campaign._id);
     });
 
-    // Finalise campaign
-    campaign.status  = sentCount > 0 ? 'completed' : 'failed';
-    campaign.sentAt  = new Date();
-    await campaign.save();
+    const estMs = estimateSendDurationMs(validLeads.length, schedule);
+    const estimateMinutes = estMs > 0 ? Math.ceil(estMs / 60000) : 0;
+    const sendingMethod = project.sendingMethod || 'brevo_api';
 
-    const finalCampaign = await Campaign.findById(campaign._id)
+    const populated = await Campaign.findById(campaign._id)
       .populate('projectId',  'name')
       .populate('templateId', 'name');
 
-    const sendingMethod = project.sendingMethod || 'brevo_api';
-
-    res.status(201).json({
+    res.status(202).json({
       success: true,
-      message: `Campaign created successfully using ${sendingMethod.toUpperCase()}. ${sentCount}/${validLeads.length} emails sent.`,
-      data:    finalCampaign,
+      startedInBackground: true,
+      message:
+        `Sending started (${sendingMethod.toUpperCase()}). ` +
+        `${validLeads.length} email(s): ${schedule.emailGapSeconds}s between emails, ` +
+        `${schedule.partCount} part(s), ${schedule.partGapMinutes}m between parts` +
+        (estimateMinutes ? ` (~${estimateMinutes} min pacing).` : '.') +
+        ' Open Campaigns to see live progress.',
+      data: populated,
+      estimateMinutes,
     });
 
   } catch (error) {

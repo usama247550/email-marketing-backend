@@ -210,12 +210,15 @@ const runAutomation = async (automationId) => {
       month: 'short', day: 'numeric', year: 'numeric',
     });
     const campaign = new Campaign({
-      name:            `Automation: ${automation.name} — ${runDate}`,
-      projectId:       project._id,
-      templateId:      template._id,
+      name:              `Automation: ${automation.name} — ${runDate}`,
+      projectId:         project._id,
+      templateId:        template._id,
       batchIds,
-      totalRecipients: leads.length,
-      status:          'sending',
+      totalRecipients:   leads.length,
+      status:            'sending',
+      emailGapSeconds:   automation.emailGapSeconds ?? 30,
+      partCount:         automation.partCount ?? 1,
+      partGapMinutes:    automation.partGapMinutes ?? 0,
     });
     await campaign.save();
 

@@ -21,6 +21,21 @@ const automationSchema = new mongoose.Schema({
     default: 50,
     min: 1,
   },
+  emailGapSeconds: {
+    type: Number,
+    default: 30,
+    min: 1,
+  },
+  partCount: {
+    type: Number,
+    default: 1,
+    min: 1,
+  },
+  partGapMinutes: {
+    type: Number,
+    default: 20,
+    min: 0,
+  },
   // "HH:mm" 24-hour format, e.g. "09:00", "14:30"
   scheduledTime: {
     type: String,

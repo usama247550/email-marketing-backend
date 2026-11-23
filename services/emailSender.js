@@ -27,6 +27,7 @@ const {
   assertTemplateVariables,
   replaceTemplateVariables,
 } = require('./templateVariables');
+const { parseSendSchedule, splitIntoParts } = require('./sendSchedule');
 
 // ─── Small utilities ──────────────────────────────────────────────────────────
 
@@ -135,7 +136,17 @@ const sendEmailsToLeads = async ({
   leads,
   campaign,
   onLeadSent = null,
+  schedule: scheduleInput = null,
 }) => {
+  const schedule = parseSendSchedule(
+    scheduleInput || {
+      emailGapSeconds: campaign?.emailGapSeconds,
+      partCount: campaign?.partCount,
+      partGapMinutes: campaign?.partGapMinutes,
+    }
+  );
+  const parts = splitIntoParts(leads, schedule.partCount);
+  const totalToSend = leads.length;
   // Stop before Brevo sees a tag we do not fill (for example {{contact.COMPANY}}).
   assertTemplateVariables(template.subject, template.body);
 
@@ -144,7 +155,20 @@ const sendEmailsToLeads = async ({
   const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || 'http://localhost:5000';
   let sentCount = 0;
 
-  for (const lead of leads) {
+  console.log(
+    `[emailSender] Pace: ${schedule.emailGapSeconds}s between emails, ` +
+    `${schedule.partCount} part(s), ${schedule.partGapMinutes}m between parts (${totalToSend} leads)`
+  );
+
+  for (let partIndex = 0; partIndex < parts.length; partIndex++) {
+    const part = parts[partIndex];
+    if (partIndex > 0 && schedule.partGapMs > 0) {
+      console.log(`[emailSender] Waiting ${schedule.partGapMinutes}m before part ${partIndex + 1}/${parts.length}`);
+      await sleep(schedule.partGapMs);
+    }
+
+    for (let i = 0; i < part.length; i++) {
+      const lead = part[i];
     try {
       // ── Unique tracking token (collision-safe) ────────────────────────────
       let trackingId;
@@ -212,7 +236,7 @@ const sendEmailsToLeads = async ({
 
         console.log(
           `[emailSender] Sent via ${sendingMethod} → ${lead.email} ` +
-          `(${sentCount}/${leads.length}, campaign: ${campaign._id})`
+          `(${sentCount}/${totalToSend}, part ${partIndex + 1}/${parts.length}, campaign: ${campaign._id})`
         );
       } else {
         emailLog.status = 'failed';
@@ -225,11 +249,6 @@ const sendEmailsToLeads = async ({
       // ── Update live campaign progress ─────────────────────────────────────
       campaign.sentCount = sentCount;
       await campaign.save();
-
-      // ── Rate-limit: 1.5 s between emails ─────────────────────────────────
-      if (sentCount < leads.length) {
-        await sleep(1500);
-      }
 
     } catch (emailError) {
       console.error(`[emailSender] Unexpected error for ${lead.email}:`, emailError);
@@ -244,6 +263,8 @@ const sendEmailsToLeads = async ({
           trackingId: generateTrackingToken(),
         }).save();
       } catch (_) { /* swallow secondary error */ }
+    }
+      if (i < part.length - 1) await sleep(schedule.emailGapMs);
     }
   }
 

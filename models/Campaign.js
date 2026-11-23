@@ -44,6 +44,18 @@ const campaignSchema = new mongoose.Schema({
   sentAt: {
     type: Date
   },
+  emailGapSeconds: {
+    type: Number,
+    default: 30,
+  },
+  partCount: {
+    type: Number,
+    default: 1,
+  },
+  partGapMinutes: {
+    type: Number,
+    default: 0,
+  },
   createdAt: {
     type: Date,
     default: Date.now
