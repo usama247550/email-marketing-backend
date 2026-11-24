@@ -96,7 +96,7 @@ const setupTransport = async (project) => {
       );
     }
 
-    transporter = nodemailer.createTransporter({
+    transporter = nodemailer.createTransport({
       host:   project.smtpHost,
       port:   project.smtpPort,
       secure: project.smtpPort === 465,
