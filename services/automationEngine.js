@@ -194,11 +194,41 @@ const runAutomation = async (automationId) => {
       .limit(automation.dailyLimit);
 
     if (leads.length === 0) {
-      console.log(`[AutomationEngine] "${automation.name}" — no new leads to send.`);
+      const baseFilter = {
+        batchId: { $in: batchIds },
+        status: 'Valid',
+        emailVerified: true,
+        email: { $exists: true, $ne: '' },
+      };
+      const sendableTotal = await Lead.countDocuments(baseFilter);
+      const alreadyEmailed = await Lead.countDocuments({
+        ...baseFilter,
+        emailedTemplateIds: automation.templateId,
+      });
+
+      const detail =
+        sendableTotal === 0
+          ? 'No verified leads in project batches yet.'
+          : alreadyEmailed >= sendableTotal
+            ? `All ${sendableTotal} verified lead(s) already received this template.`
+            : `${sendableTotal} verified lead(s) exist but none matched the send queue (check template / filters).`;
+
+      console.log(`[AutomationEngine] "${automation.name}" — no new leads to send. ${detail}`);
       automation.lastRunSentCount = 0;
+      automation.lastRunFinderMessage = detail;
       await automation.save();
       return { sentCount: 0, skipped: false };
     }
+
+  try {
+    await emailSender.setupTransport(project);
+  } catch (configErr) {
+    console.error(`[AutomationEngine] "${automation.name}" send config:`, configErr.message);
+    automation.lastRunSentCount = 0;
+    automation.lastRunFinderMessage = `Send blocked: ${configErr.message}`;
+    await automation.save();
+    return { sentCount: 0, skipped: false };
+  }
 
     console.log(
       `[AutomationEngine] "${automation.name}" sending — ` +
@@ -223,17 +253,30 @@ const runAutomation = async (automationId) => {
     await campaign.save();
 
     // ── 6. Send emails via the shared engine ──────────────────────────────
-    const { sentCount } = await emailSender.sendEmailsToLeads({
-      project,
-      template,
-      leads,
-      campaign,
-      onLeadSent: async (lead) => {
-        await Lead.findByIdAndUpdate(lead._id, {
-          $addToSet: { emailedTemplateIds: automation.templateId },
-        });
-      },
-    });
+    let sentCount = 0;
+    try {
+      const result = await emailSender.sendEmailsToLeads({
+        project,
+        template,
+        leads,
+        campaign,
+        onLeadSent: async (lead) => {
+          await Lead.findByIdAndUpdate(lead._id, {
+            $addToSet: { emailedTemplateIds: automation.templateId },
+          });
+        },
+      });
+      sentCount = result.sentCount;
+    } catch (sendErr) {
+      console.error(`[AutomationEngine] "${automation.name}" send error:`, sendErr);
+      campaign.status = 'failed';
+      campaign.sentAt = new Date();
+      await campaign.save();
+      automation.lastRunSentCount = 0;
+      automation.lastRunFinderMessage = `Send failed: ${sendErr.message || 'Unknown error'}`;
+      await automation.save();
+      return { sentCount: 0, skipped: false };
+    }
 
     // ── 7. Finalise campaign and stamp automation ─────────────────────────
     campaign.status = sentCount > 0 ? 'completed' : 'failed';
@@ -241,6 +284,10 @@ const runAutomation = async (automationId) => {
     await campaign.save();
 
     automation.lastRunSentCount = sentCount;
+    if (sentCount === 0) {
+      automation.lastRunFinderMessage =
+        'Leads were queued but Brevo rejected every send — check API key, verified sender, and Railway logs (emailSender Failed).';
+    }
     await automation.save();
 
     console.log(

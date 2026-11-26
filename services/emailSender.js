@@ -35,6 +35,14 @@ const generateTrackingToken = () => crypto.randomBytes(32).toString('hex');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const withTimeout = (promise, ms, timeoutMessage) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(timeoutMessage)), ms)
+    ),
+  ]);
+
 // ─── Low-level send helpers ───────────────────────────────────────────────────
 
 const sendEmailViaBrevo = async (apiKey, emailData) => {
@@ -76,7 +84,7 @@ const sendEmailViaSMTP = async (transporter, emailData) => {
  * Throws an Error with a human-readable message on misconfiguration so callers
  * can surface it as an HTTP 400/500 or log it in the automation engine.
  */
-const setupTransport = async (project) => {
+const setupTransport = async (project, { skipVerify = false } = {}) => {
   const sendingMethod = project.sendingMethod || 'brevo_api';
   let emailApiAccount = null;
   let transporter = null;
@@ -96,17 +104,31 @@ const setupTransport = async (project) => {
       );
     }
 
+    const smtpPort = Number(project.smtpPort) || 587;
+    const useSsl = smtpPort === 465;
+
     transporter = nodemailer.createTransport({
-      host:   project.smtpHost,
-      port:   project.smtpPort,
-      secure: project.smtpPort === 465,
-      auth:   { user: project.smtpUser, pass: project.smtpPassword },
+      host: project.smtpHost,
+      port: smtpPort,
+      secure: useSsl,
+      requireTLS: !useSsl,
+      auth: { user: project.smtpUser, pass: project.smtpPassword },
+      connectionTimeout: 15_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 20_000,
+      tls: { minVersion: 'TLSv1.2' },
     });
 
-    try {
-      await transporter.verify();
-    } catch (smtpError) {
-      throw new Error('SMTP configuration error: ' + smtpError.message);
+    if (!skipVerify) {
+      try {
+        await withTimeout(
+          transporter.verify(),
+          25_000,
+          'SMTP connection timed out. Check Hostinger host/port (try 587), email password, and that sender matches the mailbox.'
+        );
+      } catch (smtpError) {
+        throw new Error('SMTP configuration error: ' + smtpError.message);
+      }
     }
   } else {
     throw new Error(`Unknown sendingMethod: "${sendingMethod}"`);
@@ -150,7 +172,9 @@ const sendEmailsToLeads = async ({
   // Stop before Brevo sees a tag we do not fill (for example {{contact.COMPANY}}).
   assertTemplateVariables(template.subject, template.body);
 
-  const { sendingMethod, emailApiAccount, transporter } = await setupTransport(project);
+  const { sendingMethod, emailApiAccount, transporter } = await setupTransport(project, {
+    skipVerify: true,
+  });
 
   const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || 'http://localhost:5000';
   let sentCount = 0;

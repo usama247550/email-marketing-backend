@@ -5,6 +5,9 @@ const emailApiAccountController = require('../controllers/emailApiAccountControl
 // GET /api/email-api-accounts - Get all email API accounts
 router.get('/', emailApiAccountController.getAll);
 
+// POST /api/email-api-accounts/:id/test — validate key with Brevo
+router.post('/:id/test', emailApiAccountController.test);
+
 // GET /api/email-api-accounts/:id - Get email API account by ID
 router.get('/:id', emailApiAccountController.getById);
 
